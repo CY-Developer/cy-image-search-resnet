@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>以图搜图Demo</title>
+</head>
+<body>
+<h2>上传商品图片，查看相似商品</h2>
+<form action="/search" method="post" enctype="multipart/form-data">
+    <input type="file" name="file" required />
+    <button type="submit">搜索</button>
+</form>
+<hr/>
+<div>
+    <h3>推荐结果：</h3>
+    <th:block th:if="${results}">
+        <div th:each="item : ${results}">
+            <img th:src="${item.imageUrl}" width="120" style="vertical-align: middle;"/>
+            <span th:text="${item.name}"></span> (SKU: <span th:text="${item.sku}"></span>)
+            相似度：<span th:text="${item.score}"></span>
+            <br/>
+        </div>
+    </th:block>
+    <span th:if="${error}" th:text="${error}"></span>
+</div>
+</body>
+</html>
