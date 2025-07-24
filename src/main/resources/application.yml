@@ -1,21 +1,42 @@
 server:
   port: 8080
+
 spring:
+  application:
+    name: image-search
+
   datasource:
-    url: jdbc:mysql://localhost:3306/cy_oc?useSSL=false&serverTimezone=Asia/Shanghai
+    # 本地 MySQL 宿主映射端口 3307，兼容 MySQL8+ 公钥检索
+    url: jdbc:mysql://localhost:3307/image_search?allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=Asia/Shanghai
     username: root
     password: root
-    driver-class-name: com.mysql.cj.jdbc.Driver
+
 redis:
   host: localhost
   port: 6379
+
 milvus:
   host: localhost
   port: 19530
-oss:
-  endpoint: http://localhost:9000
-  accessKey: minioadmin
-  secretKey: minioadmin
+minio:
+  endpoint: http://minio:9000
+  access-key: minio
+  secret-key: minio123
   bucket: images
+
 flask:
+  # 本地 Python 特征提取服务
   url: http://localhost:5000/extract
+
+# 可选：MyBatis-Plus 配置
+mybatis-plus:
+  mapper-locations: classpath:/mapper/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# 日志级别
+logging:
+  level:
+    root: INFO
+    app.image: DEBUG
