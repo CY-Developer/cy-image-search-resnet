@@ -32,8 +32,8 @@ services:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     container_name: milvus-minio
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - ./volumes/minio:/minio_data
     command: server /minio_data
@@ -105,6 +105,7 @@ services:
     depends_on:
       - redis
       - mysql
+
 
 volumes:
   mysql_data:

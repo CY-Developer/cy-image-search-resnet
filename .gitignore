@@ -129,3 +129,5 @@ rpc-http-log*.log
 app/node_modules
 node_modules
 doc
+/volumes
+/6_jw7Ja
