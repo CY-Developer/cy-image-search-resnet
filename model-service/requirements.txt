@@ -5,6 +5,6 @@ Pillow==10.0.0
 torch==2.0.1
 torchvision==0.15.2
 timm==0.9.8
-opencv-contrib-python-headless==4.8.1.78
-python-multipart==0.0.6
+opencv-python-headless==4.8.1.78
 redis==4.5.5
+python-multipart==0.0.6

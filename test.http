@@ -1,6 +1,6 @@
 ### Single-image Extraction
-POST http://localhost:5000/extract
+POST http://127.0.0.1:5000/extract
 Content-Type: application/octet-stream
 X-API-Key: 93c1240be757f04a38c2aeb7e5cd7178
 
-< ./6_jw7Ja/6/03/ALEXANDER MCQUEEN/02/主图/画板 18.jpg
+< model-service/6_jw7Ja/6/03/ALEXANDER MCQUEEN/02/主图/画板 18.jpg
