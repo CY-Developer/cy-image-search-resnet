@@ -3,7 +3,7 @@ server:
 
 spring:
   application:
-    name: image-search
+    name: cy-image-search-resnet
 
   datasource:
     # 本地 MySQL 宿主映射端口 3307，兼容 MySQL8+ 公钥检索

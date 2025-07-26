@@ -1,113 +1,79 @@
 package app.image.service;
 
-import io.milvus.client.MilvusServiceClient;
-import io.milvus.grpc.DataType;
-import io.milvus.param.MetricType;
-import io.milvus.param.R;
-import io.milvus.param.RpcStatus;
-import io.milvus.param.collection.*;
+import io.milvus.client.MilvusClient;
+import io.milvus.grpc.MutationResult;
+import io.milvus.grpc.SearchResults;
+import io.milvus.param.*;
 import io.milvus.param.dml.InsertParam;
 import io.milvus.param.dml.SearchParam;
 import io.milvus.response.SearchResultsWrapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.jetbrains.annotations.NotNull;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import jakarta.annotation.PostConstruct;
 import java.util.*;
 
 @Service
 public class MilvusVectorService {
-    private static final Logger log = LoggerFactory.getLogger(MilvusVectorService.class);
-    private static final String COLLECTION = "image_vectors";
-    private final MilvusServiceClient client;
+    @Autowired
+    private MilvusClient client;
 
-    public MilvusVectorService(MilvusServiceClient client) {
-        this.client = client;
-    }
-
-    @PostConstruct
-    public void init() {
-        // 1. 检查 Milvus 服务是否可用
-        R<Boolean> hasResp = client.hasCollection(
-                HasCollectionParam.newBuilder()
-                        .withCollectionName(COLLECTION)
-                        .build()
-        );
-        if (hasResp.getStatus() != R.Status.Success.getCode()) {
-            log.error("无法连接到 Milvus 服务或检查 Collection 失败: code={}, msg={}",
-                    hasResp.getStatus(), hasResp.getMessage());
-            // 你可以选择抛异常终止启动，或 return 后在后续重试
-            throw new IllegalStateException("Milvus 服务不可用: " + hasResp.getMessage());
-        }
-
-        // 2. 安全取出 Boolean，防止 null
-        Boolean exists = hasResp.getData() != null && hasResp.getData();
-        if (!exists) {
-            log.info("Collection '{}' 不存在，开始创建…", COLLECTION);
-            FieldType pk = FieldType.newBuilder()
-                    .withName("id")
-                    .withDataType(DataType.Int64)
-                    .withPrimaryKey(true)
-                    .withAutoID(false)
-                    .build();
-            FieldType vec = FieldType.newBuilder()
-                    .withName("embedding")
-                    .withDataType(DataType.FloatVector)
-                    .withDimension(2048)
-                    .build();
-
-            R<RpcStatus> createResp = client.createCollection(
-                    CreateCollectionParam.newBuilder()
-                            .withCollectionName(COLLECTION)
-                            .withFieldTypes(Arrays.asList(pk, vec))
-                            .withShardsNum(1)
-                            .build()
-            );
-            if (createResp.getStatus() != R.Status.Success.getCode()) {
-                log.error("创建 Milvus Collection 失败: code={}, msg={}",
-                        createResp.getStatus(), createResp.getMessage());
-                throw new IllegalStateException("创建 Collection 失败: " + createResp.getMessage());
-            }
-            log.info("Collection '{}' 创建成功。", COLLECTION);
-        } else {
-            log.info("Collection '{}' 已存在，无需创建。", COLLECTION);
-        }
-    }
-
-
+    /**
+     * 向 Milvus 插入单条向量（id 主键 + embedding 向量）
+     */
     public void insert(Long id, List<Float> vector) {
-
         List<InsertParam.Field> fields = Arrays.asList(
-                // 主键字段
                 new InsertParam.Field("id", Collections.singletonList(id)),
-                // 向量字段（List<List<Float>>）
-                new InsertParam.Field("embedding",
-                        Collections.singletonList(vector))
+                new InsertParam.Field("embedding", Collections.singletonList(vector))
         );
-// 2. Build InsertParam，**没有** withPrimaryKeys(...) 方法
-        InsertParam insertParam = InsertParam.newBuilder()
-                .withCollectionName(COLLECTION)
+        InsertParam param = InsertParam.newBuilder()
+                .withCollectionName("image_vectors")
                 .withFields(fields)
                 .build();
-        client.insert(insertParam);
+        R<MutationResult> res = client.insert(param);
+        if (res.getStatus() != R.Status.Success.getCode()) {
+            throw new RuntimeException("Milvus insert error: " + res.getMessage());
+        }
     }
 
-    public List<Long> search(List<Float> queryVector, int topK) {
-        SearchParam param = SearchParam.newBuilder()
-                .withCollectionName(COLLECTION)
-                .withMetricType(MetricType.IP)
-                .withTopK(topK)
-                .withVectors(Collections.singletonList(queryVector))
+    /**
+     * 根据特征向量检索最相似的TopN个商品ID
+     * @param vector 查询图片的特征向量
+     * @param topN   返回数量
+     * @return List<Long> 相似商品ID列表，按相似度降序排列
+     */
+    public List<Long> searchTopN(List<Float> vector, int topN) {
+        List<List<Float>> vectors = Collections.singletonList(vector);
+        SearchParam searchParam = SearchParam.newBuilder()
+                .withCollectionName("image_vectors")
+                .withMetricType(MetricType.L2)
+                .withOutFields(Collections.singletonList("id"))
+                .withVectors(vectors)
+                .withTopK(topN)
                 .withVectorFieldName("embedding")
-                .withParams("{\"nprobe\":10}")
+                .withParams("{\"nprobe\":16}") // 注意这里不是withParamsInJson
                 .build();
-        R<io.milvus.grpc.SearchResults> resp = client.search(param);
-        SearchResultsWrapper wrapper =
-                new SearchResultsWrapper(resp.getData().getResults());
-        List<SearchResultsWrapper.IDScore> list = wrapper.getIDScore(0);
-        List<Long> ids = new ArrayList<>();
-        list.forEach(s -> ids.add(s.getLongID()));
-        return ids;
+
+        R<SearchResults> resp = client.search(searchParam);
+        List<Long> idList = getLongs(resp);
+        return idList;
+    }
+
+    @NotNull
+    private static List<Long> getLongs(R<SearchResults> resp) {
+        if (resp.getStatus() != R.Status.Success.getCode()) {
+            throw new RuntimeException("Milvus search error: " + resp.getMessage());
+        }
+        SearchResultsWrapper wrapper = new SearchResultsWrapper(resp.getData().getResults());
+        List<Long> idList = new ArrayList<>();
+        for (int i = 0; i < wrapper.getRowRecords().size(); i++) {
+            Object obj = wrapper.getFieldData("id", i);
+            if (obj instanceof Long) {
+                idList.add((Long) obj);
+            } else if (obj instanceof Integer) { // 某些建表主键可能是 int
+                idList.add(((Integer) obj).longValue());
+            }
+        }
+        return idList;
     }
 }
