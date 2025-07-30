@@ -36,6 +36,20 @@ public class MilvusVectorService {
         }
     }
 
+    public void insertAdditional(Long productId, List<Float> vector) {
+        // 可用另一个集合或区分 type 字段
+        List<InsertParam.Field> fields = Arrays.asList(
+                new InsertParam.Field("product_id", Collections.singletonList(productId)),
+                new InsertParam.Field("embedding", Collections.singletonList(vector)),
+                new InsertParam.Field("type", Collections.singletonList("additional"))
+        );
+        InsertParam param = InsertParam.newBuilder()
+                .withCollectionName("image_vectors")
+                .withFields(fields)
+                .build();
+        client.insert(param);
+    }
+
     /**
      * 根据特征向量检索最相似的TopN个商品ID
      * @param vector 查询图片的特征向量

@@ -19,7 +19,7 @@ public class ImageEmbeddingService {
     /**
      * 批量接口: 单个商品，多文件多字段上传
      */
-    public List<Float> extractBatchOneProduct(String basePath, Long productId, String mainImage, List<String> additionalImages, List<String> detailImages) throws Exception {
+    public String extractBatchOneProduct(String basePath, Long productId, String mainImage, List<String> additionalImages, List<String> detailImages) throws Exception {
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-API-Key", "93c1240be757f04a38c2aeb7e5cd7178");
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
@@ -53,6 +53,6 @@ public class ImageEmbeddingService {
             throw new RuntimeException("Batch extract failed, productId=" + productId);
         }
         // 假设返回 JSON 里有 vector 字段
-        return (List<Float>) response.getBody().get("vector");
+        return  String.valueOf(response.getBody().get("task_id"));
     }
 }

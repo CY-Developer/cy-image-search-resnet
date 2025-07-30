@@ -58,15 +58,17 @@ public class ImageSearchController {
         int count = 0;
         for (ProductImages pi : list) {
             try {
-                List<Float> vector = imageEmbeddingService.extractBatchOneProduct(
+                String taskId = imageEmbeddingService.extractBatchOneProduct(
                         BASE_IMG_PATH, pi.getProductId(), pi.getMainImage(), pi.getAdditionalImages(), pi.getDetailImages()
                 );
-                milvusVectorService.insert(pi.getProductId(), vector);
-                count++;
+//                milvusVectorService.insert(pi.getProductId(), vector);
+                if (taskId!=null && taskId.isEmpty()) {
+                    count++;
+                }
             } catch (Exception e) {
                 log.error("Product {} import failed", pi.getProductId(), e);
             }
         }
-        return "本月导入完毕, 成功商品数: " + count;
+        return "本月导入完毕, 成功商品数: " + count+ "查出来的商品："+list.size();
     }
 }

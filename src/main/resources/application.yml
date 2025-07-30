@@ -2,18 +2,18 @@ server:
   port: 8080
 
 spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
   application:
     name: cy-image-search-resnet
 
   datasource:
     # 本地 MySQL 宿主映射端口 3307，兼容 MySQL8+ 公钥检索
-    url: jdbc:mysql://localhost:3307/image_search?allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=Asia/Shanghai
+    url: jdbc:mysql://localhost:3306/cy_oc?allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=Asia/Shanghai
     username: root
     password: root
-
-redis:
-  host: localhost
-  port: 6379
 
 milvus:
   host: localhost
