@@ -9,6 +9,9 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 对接python接口
+ */
 @Service
 public class PythonVectorClient {
 

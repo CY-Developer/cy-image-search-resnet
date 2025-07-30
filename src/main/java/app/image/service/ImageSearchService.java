@@ -13,6 +13,9 @@ import java.io.File;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+/**
+ * 搜索逻辑
+ */
 
 @Service
 public class ImageSearchService {
@@ -31,23 +34,24 @@ public class ImageSearchService {
     @Autowired
     private PythonVectorClient pythonVectorClient;
 
+    // 搜索接口
     public Map<String, Object> search(MultipartFile multipartFile) throws Exception {
         File tmp = File.createTempFile("upload-", ".jpg");
         multipartFile.transferTo(tmp);
-        List<Float> queryVector = pythonVectorClient.extractVector(tmp);
+
+        // 获取向量化后的结果
+        List<?> queryVector = pythonVectorClient.extractVector(tmp);
+
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            // 强制转换类型为 Float，防止 BigDecimal 报错
-            List<?> rawVector = pythonVectorClient.extractVector(tmp);
+            // 直接使用从 Python 获取的向量进行 Milvus 查询
 
-            List<Float> fixedVector = rawVector.stream()
+            List<Float> fixedVector = queryVector.stream()
                     .map(v -> ((Number) v).floatValue())
-                    .map(Float::valueOf)
                     .collect(Collectors.toList());
 
             // 1. 主图召回
             List<Long> mainCandidates = searchByImageType(fixedVector, "main", MAIN_TOP_K);
-
             // 2. 主图召回不足时，用附图/详情图补充
             Set<Long> candidates = new HashSet<>(mainCandidates);
             if (candidates.size() < DETAIL_TOP_K) {
@@ -58,29 +62,33 @@ public class ImageSearchService {
             // 3. 在所有候选商品下，查所有商品的附图/详情图做最终比对
             List<Map<String, Object>> detailResults = searchWithinCandidates(fixedVector, candidates, DETAIL_TOP_K);
 
+            // 返回结果
             result.put("success", true);
             result.put("candidates", candidates);
             result.put("results", detailResults);
 
         } finally {
-            if (tmp.exists()) tmp.delete();
+            if (tmp.exists()) tmp.delete();  // 清理临时文件
         }
         return result;
     }
 
-    private List<Long> searchByImageType(List<Float> fixedVector, String imageType, int topK) {
+    // 根据图片类型查询向量库
+    private List<Long> searchByImageType(List<Float> queryVector, String imageType, int topK) {
         String expr = (imageType != null)
                 ? IMAGE_TYPE_FIELD + " == \"" + imageType + "\""
                 : null;
+
 
         SearchParam.Builder builder = SearchParam.newBuilder()
                 .withCollectionName(COLLECTION)
                 .withOutFields(Arrays.asList(PRODUCT_ID_FIELD, IMAGE_TYPE_FIELD))
                 .withTopK(topK)
-                .withVectors(Collections.singletonList(fixedVector))
+                .withVectors(Collections.singletonList(queryVector))
                 .withVectorFieldName(VECTOR_FIELD);
+
         if (expr != null) {
-            builder.withExpr(expr);
+            builder.withExpr(expr);  // 根据图像类型过滤
         }
 
         R<SearchResults> result = milvusClient.search(builder.build());
@@ -90,6 +98,7 @@ public class ImageSearchService {
         SearchResultsWrapper wrapper = new SearchResultsWrapper(result.getData().getResults());
         List<Object> pidObjects = Collections.singletonList(wrapper.getFieldWrapper(PRODUCT_ID_FIELD).getFieldData());
 
+        // 返回产品ID列表
         return pidObjects.stream()
                 .filter(Objects::nonNull)
                 .flatMap(obj -> {
@@ -114,19 +123,24 @@ public class ImageSearchService {
                 .collect(Collectors.toList());
     }
 
-    private List<Map<String, Object>> searchWithinCandidates(List<Float> fixedVector, Set<Long> productIds, int topK) {
+    // 在候选集下查找附图和详情图
+    private List<Map<String, Object>> searchWithinCandidates(List<Float> queryVector, Set<Long> productIds, int topK) {
         if (productIds == null || productIds.isEmpty()) return Collections.emptyList();
 
         String expr = PRODUCT_ID_FIELD + " in [" +
                 productIds.stream().map(String::valueOf).collect(Collectors.joining(",")) +
                 "] and " + IMAGE_TYPE_FIELD + " != \"main\"";
 
+        // 修复：确保传递给 Milvus 的是 List<List<Float>> 类型
+        List<List<Float>> vectorList = new ArrayList<>();
+        vectorList.add(queryVector);  // 将 queryVector 添加为 List<List<Float>> 中的一个元素
+
         SearchParam param = SearchParam.newBuilder()
                 .withCollectionName(COLLECTION)
                 .withOutFields(Arrays.asList(PRODUCT_ID_FIELD, IMAGE_TYPE_FIELD))
                 .withExpr(expr)
                 .withTopK(topK)
-                .withVectors(Collections.singletonList(fixedVector))
+                .withVectors(vectorList)  // 传递的是 List<List<Float>> 类型
                 .withVectorFieldName(VECTOR_FIELD)
                 .build();
 
@@ -135,6 +149,7 @@ public class ImageSearchService {
             return Collections.emptyList();
         }
 
+        // 处理返回结果
         SearchResultsWrapper wrapper = new SearchResultsWrapper(result.getData().getResults());
         List<Object> productIdsResult = (List<Object>) wrapper.getFieldWrapper(PRODUCT_ID_FIELD).getFieldData();
         List<Object> imageTypes = (List<Object>) wrapper.getFieldWrapper(IMAGE_TYPE_FIELD).getFieldData();
@@ -149,6 +164,7 @@ public class ImageSearchService {
             allResults.add(row);
         }
 
+        // 根据分数进行排序并限制返回结果的数量
         return allResults.stream()
                 .sorted((a, b) -> Float.compare((Float) b.get("score"), (Float) a.get("score")))
                 .limit(topK)

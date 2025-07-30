@@ -8,6 +8,10 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * 本地的utils将url优化成本地路径
+ */
+
 public class HtmlUtils {
     private static final Pattern IMG_SRC = Pattern.compile("<img\\s+[^>]*src=\\\"(.*?)\\\"", Pattern.CASE_INSENSITIVE);
 

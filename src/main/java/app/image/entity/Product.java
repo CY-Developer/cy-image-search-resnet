@@ -1,4 +1,5 @@
 package app.image.entity;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -12,5 +13,9 @@ public class Product {
     private Long productId;
     private String image; // 主图路径
     private Date dateAdded;
+    @TableField(exist = false)
+    private String categoryName;
     // 其他字段...
 }
+
+

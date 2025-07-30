@@ -1,44 +1,53 @@
 import cv2
 import numpy as np
 from PIL import Image
+import torch
+from torchvision import models, transforms
 
-def preprocess_light(image_bytes: bytes, category: str = "default") -> Image.Image:
-    arr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    orig = img.copy()  # 保留原图用于裁剪
+# 加载目标检测模型（例如，Faster R-CNN）
+model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+model.eval()
 
-    # 选择不同类目增强策略
-    if category == "shoe":
-        # 增强鞋子图像的颜色和轮廓
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        _, s, v = cv2.split(hsv)
-        mask = cv2.inRange(s, 20, 255)  # 保留高饱和度区域
-    elif category == "bag":
-        # 包的图像在光泽度上的要求
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        _, s, _ = cv2.split(hsv)
-        mask = cv2.inRange(s, 0, 255)  # 保留亮度较强的部分
-    elif category == "watch":
-        # 手表类目，突出反射、金属质感
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    elif category == "jewelry":
-        # 珠宝类目，突出金属光泽与透明度
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        _, s, v = cv2.split(hsv)
-        mask = cv2.inRange(v, 0, 255)  # 保留高光区域
-    else:
-        # 默认处理
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+# 图像目标检测函数
+def detect_objects_in_image(image: Image.Image):
+    transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
+    image_tensor = transform(image).unsqueeze(0)
 
-    # 查找最大外接轮廓（排除背景）
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if cnts:
-        x, y, w, h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
-        crop = orig[y:y+h, x:x+w]
-    else:
-        crop = orig
+    with torch.no_grad():
+        prediction = model(image_tensor)
 
-    # 返回 RGB 图像用于后续模型处理
-    return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+    detected_items = []
+    for element in range(len(prediction[0]['boxes'])):
+        box = prediction[0]['boxes'][element].cpu().numpy()
+        score = prediction[0]['scores'][element].cpu().numpy()
+        if score > 0.5:  # 假设 score > 0.5 为有效检测
+            detected_items.append({
+                'box': box,
+                'score': score
+            })
+
+    return detected_items
+
+def crop_image_from_detection(image: Image.Image, item: dict) -> Image.Image:
+    x_min, y_min, x_max, y_max = item['box']
+    img_array = np.array(image)
+
+    # 裁剪出商品图像区域
+    cropped_img = img_array[int(y_min):int(y_max), int(x_min):int(x_max)]
+
+    # 转回PIL Image格式
+    return Image.fromarray(cropped_img)
+
+def fuse_item_vectors(item_vectors: list) -> np.ndarray:
+    mat = np.stack(item_vectors)
+    sim = mat @ mat.T
+    weights = np.exp(np.clip(sim.mean(1), 1e-5, None))
+    weights /= weights.sum()
+
+    # 加权融合
+    fused = np.sum([w * v for w, v in zip(weights, item_vectors)], axis=0)
+    fused /= np.linalg.norm(fused) + 1e-8  # L2归一化
+
+    return fused

@@ -4,7 +4,6 @@ import app.image.entity.ImageInfo;
 import app.image.entity.ProductImages;
 import app.image.service.ImageEmbeddingService;
 import app.image.service.ImageInfoService;
-import app.image.service.MilvusVectorService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
@@ -25,8 +24,7 @@ public class ImageSearchController {
     @Autowired
     private ImageEmbeddingService imageEmbeddingService;
 
-    @Autowired
-    private MilvusVectorService milvusVectorService;
+
 
     @Autowired
     private ImageInfoService imageInfoService;
@@ -59,7 +57,7 @@ public class ImageSearchController {
         for (ProductImages pi : list) {
             try {
                 String taskId = imageEmbeddingService.extractBatchOneProduct(
-                        BASE_IMG_PATH, pi.getProductId(), pi.getMainImage(), pi.getAdditionalImages(), pi.getDetailImages()
+                        BASE_IMG_PATH, pi.getProductId(),pi.getCategoryName(), pi.getMainImage(), pi.getAdditionalImages(), pi.getDetailImages()
                 );
 //                milvusVectorService.insert(pi.getProductId(), vector);
                 if (taskId!=null && taskId.isEmpty()) {
