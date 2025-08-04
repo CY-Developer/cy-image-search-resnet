@@ -23,14 +23,14 @@ public class ImageEmbeddingService {
     /**
      * 批量接口: 单个商品，多文件多字段上传
      */
-    public String extractBatchOneProduct(String basePath, Long productId, String categoryName,  String mainImage, List<String> additionalImages, List<String> detailImages) throws Exception {
+    public String extractBatchOneProduct(String basePath, Long productId, String category,  String mainImage, List<String> additionalImages, List<String> detailImages) throws Exception {
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-API-Key", "93c1240be757f04a38c2aeb7e5cd7178");
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
         body.add("product_id", productId.toString());
-        body.add("categoryName", categoryName);
+        body.add("category", category);
         if (mainImage != null) {
             Path mainPath = Paths.get(basePath, mainImage);
             body.add("main_image", new FileSystemResource(mainPath.toFile()));

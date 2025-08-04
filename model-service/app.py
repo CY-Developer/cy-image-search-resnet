@@ -1,3 +1,4 @@
+# app.py
 import os
 import uuid
 import json
@@ -6,12 +7,13 @@ import torch
 import redis
 import pickle
 import logging
+import traceback
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from typing import List
 
-from model import MobileViTFeatureExtractor
+from model import OpenCLIPFeatureExtractor  # 替换模型类
 from utils_fast import multi_scale_preprocess, detect_objects_in_image, crop_image_from_detection, fuse_item_vectors
 
 # 配置日志
@@ -24,7 +26,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 app = FastAPI(title="Image Search Service")
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
-extractor = MobileViTFeatureExtractor(device="cuda" if torch.cuda.is_available() else "cpu")
+extractor = OpenCLIPFeatureExtractor(device="cuda" if torch.cuda.is_available() else "cpu")
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
@@ -38,35 +40,29 @@ async def health_check():
     return {"status": "ok"}
 
 @app.post("/extract")
-async def extract_vector(file: UploadFile = File(...), category: str = Form(...)):
+async def extract_vector(file: UploadFile = File(...)):
     try:
-        # 读取并预处理图片
         data = await file.read()
-        img = multi_scale_preprocess(data, category)  # 使用多尺度预处理
-
-        # 目标检测：检测图片中的商品并返回每个商品的区域
+        img = multi_scale_preprocess(data, "default")
         detected_items = detect_objects_in_image(img)
 
-        # 针对每个检测到的商品区域，提取特征
         item_vectors = []
         for item in detected_items:
-            item_image = crop_image_from_detection(img, item)  # 从检测到的区域裁剪出商品图像
+            item_image = crop_image_from_detection(img, item)
+            if getattr(item_image, "width", 0) < 10 or getattr(item_image, "height", 0) < 10:
+                item_image = img
             vector = extractor.extract(item_image, is_main=False)
             item_vectors.append(vector)
 
-        # 如果没有检测到商品，返回错误
         if len(item_vectors) == 0:
-            raise HTTPException(status_code=400, detail="No items detected in the image")
+            vector = extractor.extract(img, is_main=False)
+            item_vectors.append(vector)
 
-        # 这里可以进行进一步的向量融合，例如对多个商品向量进行加权融合
         final_vector = fuse_item_vectors(item_vectors)
-
-        # 返回最终的向量
         logger.info("Successfully extracted and fused vectors.")
         return {"vector": final_vector.tolist()}
-
     except Exception as e:
-        logger.error(f"Error extracting vector: {str(e)}")
+        logger.error(f"Error extracting vector: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract-batch")
@@ -108,43 +104,83 @@ def process_batch(task_id: str):
         raw = redis_client.get(f"task:{task_id}:req")
         if not raw:
             logger.error(f"Task {task_id} not found in Redis")
+            # 处理不到 req，写个失败的 res，防止查不到
+            redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
+                "status": "fail",
+                "msg": "task req not found in redis"
+            }))
             return
+
         payload = pickle.loads(raw)
         results = {"recognized": [], "failed": []}
 
-        # 进行图像处理，提取特征
-        main_img = multi_scale_preprocess(payload["main"], category=payload["category"])
-        vecs = [extractor.extract(main_img, is_main=True)]  # 主图
+        try:
+            # 主流程（图片预处理、特征提取、融合等）
+            vecs = []
+            weights = []
+            main_img = multi_scale_preprocess(payload["main"], category=payload["category"])
+            vec_main = extractor.extract(main_img, is_main=True)
+            vecs.append(vec_main)
+            weights.append(1.45)
+            for b in payload["additional"]:
+                try:
+                    img = multi_scale_preprocess(b, category=payload["category"])
+                    v = extractor.extract(img)
+                    vecs.append(v)
+                    weights.append(1.0)
+                except Exception as ex:
+                    logger.warning(f"skip one additional image due to error: {ex}")
 
-        # 处理附图和详情图
-        for b in payload["additional"] + payload["detail"]:
-            img = multi_scale_preprocess(b, category=payload["category"])
-            vecs.append(extractor.extract(img))
+            for b in payload["detail"]:
+                try:
+                    img = multi_scale_preprocess(b, category=payload["category"])
+                    v = extractor.extract(img)
+                    vecs.append(v)
+                    weights.append(1.0)
+                except Exception as ex:
+                    logger.warning(f"skip one detail image due to error: {ex}")
 
-        # 检查是否有足够的有效图像
-        if len(vecs) < 2:
-            raise Exception("Too few valid images")
+            if len(vecs) < 2:
+                raise Exception("Too few valid images")
 
-        # 计算相似度并融合向量
-        mat = np.stack(vecs)
-        sim = mat @ mat.T
-        weights = np.exp(np.clip(sim.mean(1), 1e-5, None))
-        weights /= weights.sum()
-        fused = np.sum([w * v for w, v in zip(weights, vecs)], axis=0)
-        fused /= np.linalg.norm(fused) + 1e-8
+            # 融合权重并归一化
+            mat = np.stack(vecs)
+            weight_array = np.array(weights).reshape(-1, 1)
+            fused = (mat * weight_array).sum(axis=0)
+            fused /= np.linalg.norm(fused) + 1e-8
 
-        # 将结果存储到Redis
-        results["recognized"].append({
-            "product_id": payload["product_id"],
-            "vector": fused.tolist(),
-            "vectors": [v.tolist() for v in vecs]
-        })
+            results["recognized"].append({
+                "product_id": payload["product_id"],
+                "vector": fused.tolist(),
+                "vectors": [v.tolist() for v in vecs]
+            })
+            # 正常处理，写入 res
+            redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
+                "status": "success",
+                "result": results
+            }))
+            logger.info(f"Successfully processed task {task_id}")
 
-        # 保存结果
-        json_data = json.dumps(results)
-        redis_client.setex(f"task:{task_id}:res", 3600, json_data)
-        redis_client.delete(f"task:{task_id}:req")
-        logger.info(f"Successfully processed task {task_id}")
+        except Exception as proc_e:
+            # 处理出错也写入 res，带失败原因
+            logger.error(f"Processing error for task {task_id}: {str(proc_e)}")
+            redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
+                "status": "fail",
+                "msg": str(proc_e)
+            }))
 
     except Exception as e:
-        logger.error(f"Error processing batch {task_id}: {str(e)}")
+        # 大 try 捕获“拿 req 本身”都出错的情况
+        logger.error(f"Fatal error for task {task_id}: {str(e)}")
+        redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
+            "status": "fail",
+            "msg": f"fatal error: {str(e)}"
+        }))
+
+    finally:
+        # 无论成败都删掉 req，避免死信队列堆积
+        try:
+            redis_client.delete(f"task:{task_id}:req")
+        except Exception as del_e:
+            logger.error(f"Failed to delete req for task {task_id}: {str(del_e)}")
+

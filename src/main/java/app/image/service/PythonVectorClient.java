@@ -19,7 +19,7 @@ public class PythonVectorClient {
     private static final String PYTHON_URL = "http://localhost:5000/extract";
     private static final String API_KEY = "93c1240be757f04a38c2aeb7e5cd7178";
 
-    public static List<Float> extractVector(File imageFile) throws IOException {
+    public  List<Float> extractVector(File imageFile) throws IOException {
         RequestBody fileBody = RequestBody.create(imageFile, MediaType.parse("image/jpeg"));
         MultipartBody requestBody = new MultipartBody.Builder()
                 .setType(MultipartBody.FORM)

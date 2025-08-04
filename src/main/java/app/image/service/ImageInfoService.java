@@ -48,15 +48,15 @@ public class ImageInfoService {
         Map<Long, List<String>> productCategoryMap = new HashMap<>();
         for (Map<String, Object> productCategory : productCategories) {
             Long productId = MapUtils.getLong(productCategory,"product_id") ;
-            String categoryName = MapUtils.getString(productCategory,"category_name");
+            String category = MapUtils.getString(productCategory,"category_name");
 
-            productCategoryMap.computeIfAbsent(productId, k -> new ArrayList<>()).add(categoryName);
+            productCategoryMap.computeIfAbsent(productId, k -> new ArrayList<>()).add(category);
         }
 
         // 将类目名称存入产品类
         for (Product product : products) {
-            List<String> categoryNames = productCategoryMap.getOrDefault(product.getProductId(), new ArrayList<>());
-            product.setCategoryName(String.join(", ", categoryNames));  // 将类目名称设置到产品类目字段
+            List<String> categorys = productCategoryMap.getOrDefault(product.getProductId(), new ArrayList<>());
+            product.setCategory(String.join(", ", categorys));  // 将类目名称设置到产品类目字段
         }
 
         // 3. 一次查出本月所有附图
@@ -89,7 +89,7 @@ public class ImageInfoService {
             pi.setMainImage(p.getImage());
             pi.setAdditionalImages(addMap.getOrDefault(p.getProductId(), List.of()));
             pi.setDetailImages(detailMap.getOrDefault(p.getProductId(), List.of()));
-            pi.setCategoryName(p.getCategoryName());  // 加上类目名称
+            pi.setCategory(p.getCategory());  // 加上类目名称
             all.add(pi);
         }
         return all;

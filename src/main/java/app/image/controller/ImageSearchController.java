@@ -4,6 +4,8 @@ import app.image.entity.ImageInfo;
 import app.image.entity.ProductImages;
 import app.image.service.ImageEmbeddingService;
 import app.image.service.ImageInfoService;
+import app.image.service.ImageSearchService;
+import com.alibaba.fastjson.JSON;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
@@ -12,6 +14,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 图片搜索相关接口
@@ -25,48 +28,47 @@ public class ImageSearchController {
     private ImageEmbeddingService imageEmbeddingService;
 
 
-
     @Autowired
     private ImageInfoService imageInfoService;
 
     private static final String BASE_IMG_PATH = "model-service/6_jw7Ja";
 
-//    /**
-//     * 上传单张图片，返回最相似的20个商品ID
-//     * @param file 图片文件
-//     * @return 商品ID列表（按相似度排序）
-//     */
-//    @PostMapping(value = "/by-image", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-//    public List<Long> searchByImage(@RequestParam("file") MultipartFile file) {
-//        try {
-//            byte[] imgBytes = file.getBytes();
-//            List<Float> vector = imageEmbeddingService.extractFromBytes(imgBytes);
-//            return milvusVectorService.searchTopN(vector, 20);
-//        } catch (Exception e) {
-//            log.error("searchByImage error", e);
-//            return new ArrayList<>();
-//        }
-//    }
 
+
+    @Autowired
+    private ImageSearchService imageSearchService;
+
+
+    @PostMapping("/batch-import/search")
+    public Map<String, Object> searchByImage(@RequestParam("file") MultipartFile file) {
+        try {
+            return Map.of("success", true, "message",imageSearchService.searchProducts(file));
+        } catch (Exception e) {
+            return Map.of("success", false, "message", e.getMessage());
+        }
+    }
 
 
     @PostMapping("/batch-import/month")
     public String importAll(@RequestParam int year, @RequestParam int month) {
         List<ProductImages> list = imageInfoService.getAllProductImagesByMonth(year, month);
+        List<ProductImages> filterList = list.stream().filter(p -> !p.getCategory().isEmpty()).toList();
         int count = 0;
-        for (ProductImages pi : list) {
+        for (ProductImages pi : filterList) {
             try {
                 String taskId = imageEmbeddingService.extractBatchOneProduct(
-                        BASE_IMG_PATH, pi.getProductId(),pi.getCategoryName(), pi.getMainImage(), pi.getAdditionalImages(), pi.getDetailImages()
+                        BASE_IMG_PATH, pi.getProductId(), pi.getCategory(), pi.getMainImage(),
+                            pi.getAdditionalImages(), pi.getDetailImages()
                 );
-//                milvusVectorService.insert(pi.getProductId(), vector);
-                if (taskId!=null && taskId.isEmpty()) {
+                if (taskId != null && taskId.isEmpty()) {
                     count++;
                 }
             } catch (Exception e) {
                 log.error("Product {} import failed", pi.getProductId(), e);
             }
         }
-        return "本月导入完毕, 成功商品数: " + count+ "查出来的商品："+list.size();
+        return "本月导入完毕, 成功商品数: " + count
+                + "查出来的商品Id：" + JSON.toJSONString(list.stream().map(ProductImages::getProductId).toList())
+                + "过滤掉没有类目商品的id" + JSON.toJSONString(filterList.stream().map(ProductImages::getProductId).toList());
     }
 }

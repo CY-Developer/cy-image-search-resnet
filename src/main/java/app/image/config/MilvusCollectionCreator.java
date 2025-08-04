@@ -61,7 +61,7 @@ public class MilvusCollectionCreator {
         FieldType embedding = FieldType.newBuilder()
                 .withName("embedding")
                 .withDataType(DataType.FloatVector)
-                .withDimension(864)
+                .withDimension(512)
                 .build();
 
         // 创建 Collection 参数

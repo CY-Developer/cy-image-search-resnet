@@ -14,7 +14,7 @@ public class Product {
     private String image; // 主图路径
     private Date dateAdded;
     @TableField(exist = false)
-    private String categoryName;
+    private String category;
     // 其他字段...
 }
 

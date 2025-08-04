@@ -10,16 +10,4 @@ import java.util.*;
 @RestController
 @RequestMapping("/api/search")
 public class VectorSearchController {
-
-    @Autowired
-    private ImageSearchService imageSearchService;
-
-    @PostMapping
-    public Map<String, Object> searchByImage(@RequestParam("file") MultipartFile file) {
-        try {
-            return imageSearchService.search(file);
-        } catch (Exception e) {
-            return Map.of("success", false, "message", e.getMessage());
-        }
-    }
 }

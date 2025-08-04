@@ -27,7 +27,7 @@ public class RedisTaskConsumer {
     @Value("${milvus.collection.name:product_vectors}")
     private String COLLECTION;
 
-    @Value("${vector.dimension:864}")
+    @Value("${vector.dimension:512}")
     private int VECTOR_DIM;
 
     private static final String FIELD_VECTOR_ID = "vector_id";
@@ -65,7 +65,9 @@ public class RedisTaskConsumer {
         if (jsonString == null) return false;
 
         Map<String, Object> obj = JSON.parseObject(jsonString, new TypeReference<>() {});
-        Object recognizedRaw = obj.get("recognized");
+        Object result =  obj.get("result");
+        if (!(result instanceof Map<?,?> resultMap)) return false;
+        Object recognizedRaw = resultMap.get("recognized");
         if (!(recognizedRaw instanceof List<?> recognizedList)) return false;
 
         List<String> vectorIds = new ArrayList<>();
@@ -114,7 +116,7 @@ public class RedisTaskConsumer {
 
         // 插入新向量
         boolean success = batchInsertVectors(vectorIds, productIds, vectors, imageTypes);
-        logFailedProducts(obj);
+//        logFailedProducts(obj);
         return success;
     }
 
@@ -211,8 +213,8 @@ public class RedisTaskConsumer {
     }
 
     private void logFailedProducts(Map<String, Object> obj) {
-        Object failed = obj.get("failed");
-        if (failed != null) {
+        List<?> failed = (List)obj.get("failed");
+        if (!failed.isEmpty()) {
             log.info("Failed products: {}", JSON.toJSONString(failed));
         }
     }

@@ -1,7 +1,11 @@
 package app.image.service;
 
+import io.milvus.client.MilvusServiceClient;
 import io.milvus.client.MilvusClient;
 import io.milvus.grpc.SearchResults;
+import io.milvus.grpc.SearchResultData;
+import io.milvus.param.ConnectParam;
+import io.milvus.param.MetricType;
 import io.milvus.param.R;
 import io.milvus.param.dml.SearchParam;
 import io.milvus.response.SearchResultsWrapper;
@@ -10,164 +14,106 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
+import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.*;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
-/**
- * 搜索逻辑
- */
 
 @Service
 public class ImageSearchService {
 
-    private static final String COLLECTION = "product_vectors";
-    private static final String VECTOR_FIELD = "embedding";
-    private static final String PRODUCT_ID_FIELD = "product_id";
-    private static final String IMAGE_TYPE_FIELD = "image_type";
-    private static final int MAIN_TOP_K = 30;
-    private static final int DETAIL_TOP_K = 5;
-    private static final int ADDITIONAL_SUPPLY_K = 50;
-
+    @Autowired
+    private PythonVectorClient pVectorClient;
     @Autowired
     private MilvusClient milvusClient;
+    // 常量参数
+    private static final String COLLECTION_NAME = "product_vectors";
+    private static final String VECTOR_FIELD = "embedding";
+    private static final int TOP_K_VECTOR = 400;   // 向量库中返回前40张最相似的图片
+    private static final int TOP_N_PRODUCT = 100;  // 聚类后最终返回TopN商品（按需过滤）
 
-    @Autowired
-    private PythonVectorClient pythonVectorClient;
-
-    // 搜索接口
-    public Map<String, Object> search(MultipartFile multipartFile) throws Exception {
-        File tmp = File.createTempFile("upload-", ".jpg");
-        multipartFile.transferTo(tmp);
-
-        // 获取向量化后的结果
-        List<?> queryVector = pythonVectorClient.extractVector(tmp);
-
-        Map<String, Object> result = new LinkedHashMap<>();
-        try {
-            // 直接使用从 Python 获取的向量进行 Milvus 查询
-
-            List<Float> fixedVector = queryVector.stream()
-                    .map(v -> ((Number) v).floatValue())
-                    .collect(Collectors.toList());
-
-            // 1. 主图召回
-            List<Long> mainCandidates = searchByImageType(fixedVector, "main", MAIN_TOP_K);
-            // 2. 主图召回不足时，用附图/详情图补充
-            Set<Long> candidates = new HashSet<>(mainCandidates);
-            if (candidates.size() < DETAIL_TOP_K) {
-                List<Long> additional = searchByImageType(fixedVector, null, ADDITIONAL_SUPPLY_K);
-                candidates.addAll(additional);
-            }
-
-            // 3. 在所有候选商品下，查所有商品的附图/详情图做最终比对
-            List<Map<String, Object>> detailResults = searchWithinCandidates(fixedVector, candidates, DETAIL_TOP_K);
-
-            // 返回结果
-            result.put("success", true);
-            result.put("candidates", candidates);
-            result.put("results", detailResults);
-
-        } finally {
-            if (tmp.exists()) tmp.delete();  // 清理临时文件
-        }
-        return result;
-    }
-
-    // 根据图片类型查询向量库
-    private List<Long> searchByImageType(List<Float> queryVector, String imageType, int topK) {
-        String expr = (imageType != null)
-                ? IMAGE_TYPE_FIELD + " == \"" + imageType + "\""
-                : null;
+    private static final String MILVUS_HOST = "127.0.0.1";
+    private static final int MILVUS_PORT = 19530;
 
 
-        SearchParam.Builder builder = SearchParam.newBuilder()
-                .withCollectionName(COLLECTION)
-                .withOutFields(Arrays.asList(PRODUCT_ID_FIELD, IMAGE_TYPE_FIELD))
-                .withTopK(topK)
-                .withVectors(Collections.singletonList(queryVector))
-                .withVectorFieldName(VECTOR_FIELD);
+    /**
+     * 调用 Milvus 进行向量搜索
+     */
+    public SearchParam buildSearchParam(String collectionName, String vectorField, List<?> queryVector, int topK) {
 
-        if (expr != null) {
-            builder.withExpr(expr);  // 根据图像类型过滤
-        }
-
-        R<SearchResults> result = milvusClient.search(builder.build());
-        if (!result.getStatus().equals(R.Status.Success.getCode())) {
-            return Collections.emptyList();
-        }
-        SearchResultsWrapper wrapper = new SearchResultsWrapper(result.getData().getResults());
-        List<Object> pidObjects = Collections.singletonList(wrapper.getFieldWrapper(PRODUCT_ID_FIELD).getFieldData());
-
-        // 返回产品ID列表
-        return pidObjects.stream()
-                .filter(Objects::nonNull)
-                .flatMap(obj -> {
-                    if (obj instanceof Number) {
-                        return Stream.of(((Number) obj).longValue());
-                    } else if (obj instanceof String) {
-                        try {
-                            return Stream.of(Long.parseLong((String) obj));
-                        } catch (Exception e) {
-                            return Stream.empty();
-                        }
-                    } else if (obj instanceof List<?>) {
-                        return ((List<?>) obj).stream()
-                                .filter(Objects::nonNull)
-                                .filter(o -> o instanceof Number)
-                                .map(o -> ((Number) o).longValue());
+        List<Float> fixedVector = queryVector.stream()
+                .map(v -> {
+                    if (v instanceof BigDecimal) {
+                        return ((BigDecimal) v).floatValue();
+                    } else if (v instanceof Number) {
+                        return ((Number) v).floatValue();
                     } else {
-                        return Stream.empty();
+                        throw new IllegalArgumentException("向量必须是数字类型，实际类型: " + v.getClass().getName());
                     }
                 })
-                .distinct()
+                .collect(Collectors.toList());
+
+        return SearchParam.newBuilder()
+                .withCollectionName(collectionName)
+                .withVectorFieldName(vectorField)
+                .withOutFields(Collections.singletonList("product_id"))
+                .withTopK(topK)
+                .withMetricType(MetricType.L2)
+                .withVectors(Collections.singletonList(fixedVector))
+                .withParams("{\"nprobe\":10}")
+                .build();
+    }
+
+    /**
+     * 聚合搜索结果（最终修正，完全兼容 Milvus 2.2.11）
+     */
+
+    public List<Map<String, Object>> rankByProductId(SearchResultsWrapper wrapper, SearchResultData resultData, int topN) {
+        List<?> productIds = wrapper.getFieldData("product_id", 0);
+        List<Float> scoreList = resultData.getScoresList();
+
+        if (productIds == null || scoreList == null || productIds.size() != scoreList.size()) {
+            throw new IllegalStateException("Milvus 返回数据维度不一致");
+        }
+
+        Map<String, List<Float>> grouped = new HashMap<>();
+        for (int i = 0; i < productIds.size(); i++) {
+            String pid = productIds.get(i).toString();
+            grouped.computeIfAbsent(pid, k -> new ArrayList<>()).add(scoreList.get(i));
+        }
+
+        // 按平均分排序，并组装成你要的格式
+        return grouped.entrySet().stream()
+                .map(e -> {
+                    Map<String, Object> map = new HashMap<>();
+                    map.put("product_id", e.getKey());
+                    map.put("score", average(e.getValue()));
+                    return map;
+                })
+                .sorted((a, b) -> Float.compare(
+                        (float) b.get("score"),
+                        (float) a.get("score")
+                ))
+                .limit(topN)
                 .collect(Collectors.toList());
     }
 
-    // 在候选集下查找附图和详情图
-    private List<Map<String, Object>> searchWithinCandidates(List<Float> queryVector, Set<Long> productIds, int topK) {
-        if (productIds == null || productIds.isEmpty()) return Collections.emptyList();
 
-        String expr = PRODUCT_ID_FIELD + " in [" +
-                productIds.stream().map(String::valueOf).collect(Collectors.joining(",")) +
-                "] and " + IMAGE_TYPE_FIELD + " != \"main\"";
+    private float average(List<Float> values) {
+        return (float) values.stream().mapToDouble(Float::doubleValue).average().orElse(0.0);
+    }
 
-        // 修复：确保传递给 Milvus 的是 List<List<Float>> 类型
-        List<List<Float>> vectorList = new ArrayList<>();
-        vectorList.add(queryVector);  // 将 queryVector 添加为 List<List<Float>> 中的一个元素
-
-        SearchParam param = SearchParam.newBuilder()
-                .withCollectionName(COLLECTION)
-                .withOutFields(Arrays.asList(PRODUCT_ID_FIELD, IMAGE_TYPE_FIELD))
-                .withExpr(expr)
-                .withTopK(topK)
-                .withVectors(vectorList)  // 传递的是 List<List<Float>> 类型
-                .withVectorFieldName(VECTOR_FIELD)
-                .build();
-
+    /**
+     * 主入口：上传图 → 提向量 → 查 Milvus → 聚类返回 TopN 商品ID（供商品过滤）
+     */
+    public  List<Map<String, Object>>  searchProducts(MultipartFile multipartFile) throws Exception {
+        File imageFile = File.createTempFile("upload-", ".jpg");
+        multipartFile.transferTo(imageFile);
+        List<?> queryVector = pVectorClient.extractVector(imageFile);
+        SearchParam param = buildSearchParam(COLLECTION_NAME, VECTOR_FIELD, queryVector, TOP_K_VECTOR);
         R<SearchResults> result = milvusClient.search(param);
-        if (!result.getStatus().equals(R.Status.Success.getCode())) {
-            return Collections.emptyList();
-        }
-
-        // 处理返回结果
-        SearchResultsWrapper wrapper = new SearchResultsWrapper(result.getData().getResults());
-        List<Object> productIdsResult = (List<Object>) wrapper.getFieldWrapper(PRODUCT_ID_FIELD).getFieldData();
-        List<Object> imageTypes = (List<Object>) wrapper.getFieldWrapper(IMAGE_TYPE_FIELD).getFieldData();
-        List<Float> scores = result.getData().getResults().getScoresList();
-
-        List<Map<String, Object>> allResults = new ArrayList<>();
-        for (int i = 0; i < scores.size(); i++) {
-            Map<String, Object> row = new HashMap<>();
-            row.put("product_id", productIdsResult.get(i));
-            row.put("image_type", imageTypes.get(i));
-            row.put("score", scores.get(i));
-            allResults.add(row);
-        }
-
-        // 根据分数进行排序并限制返回结果的数量
-        return allResults.stream()
-                .sorted((a, b) -> Float.compare((Float) b.get("score"), (Float) a.get("score")))
-                .limit(topK)
-                .collect(Collectors.toList());
+        SearchResultData resultData = result.getData().getResults();
+        SearchResultsWrapper wrapper = new SearchResultsWrapper(resultData);
+        return rankByProductId(wrapper, resultData, TOP_N_PRODUCT);
     }
 }

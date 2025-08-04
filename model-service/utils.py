@@ -14,13 +14,13 @@ def preprocess_image_v2(image_bytes: bytes, category: str = "default") -> Image.
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     # 根据商品类别增强不同特征
-    if category == "shoe":
+    if category == "Shoes":
         img = enhance_shoe_texture(img)
-    elif category == "bag":
+    elif category == "Bag":
         img = enhance_bag_gloss(img)
-    elif category == "watch":
+    elif category == "Watches":
         img = enhance_watch_reflection(img)
-    elif category == "jewelry":
+    elif category == "Jewelry":
         img = enhance_jewelry_highlight(img)
 
     # 标准的图像处理步骤

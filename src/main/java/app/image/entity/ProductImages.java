@@ -9,5 +9,5 @@ public class ProductImages {
     private String mainImage;
     private List<String> additionalImages;
     private List<String> detailImages;
-    private String categoryName;
+    private String category;
 }

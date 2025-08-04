@@ -17,7 +17,7 @@ spring:
 
 milvus:
   host: localhost
-  port: 19530
+  uzport: 19530
 minio:
   endpoint: http://minio:9000
   access-key: minio

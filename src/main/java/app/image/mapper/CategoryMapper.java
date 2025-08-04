@@ -13,11 +13,12 @@ public interface CategoryMapper {
             "SELECT ptc.product_id, cd.name AS category_name " +
             "FROM oc_product_to_category ptc " +
             "JOIN oc_category_description cd ON ptc.category_id = cd.category_id " +
+            "JOIN oc_category oc ON ptc.category_id = oc.category_id " +
             "WHERE ptc.product_id IN " +
             "<foreach item='item' collection='productIds' open='(' separator=',' close=')'>" +
             "#{item}" +
             "</foreach> " +
-            "AND cd.language_id = 1 " + 
+            "AND cd.language_id = 1  and  oc.parent_id  = 0 " +
             "</script>")
     List<Map<String, Object>> getCategoriesByProductIds(List<Long> productIds);
 }
