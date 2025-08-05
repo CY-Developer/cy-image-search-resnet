@@ -85,7 +85,7 @@ public class MilvusCollectionCreator {
                 .withFieldName("embedding")
                 .withIndexName("embedding_idx")
                 .withIndexType(IndexType.IVF_FLAT)
-                .withMetricType(MetricType.L2)
+                .withMetricType(MetricType.IP)
                 .withExtraParam("{\"nlist\":128}")
                 .build());
 

@@ -65,10 +65,25 @@ public class RedisTaskConsumer {
         if (jsonString == null) return false;
 
         Map<String, Object> obj = JSON.parseObject(jsonString, new TypeReference<>() {});
-        Object result =  obj.get("result");
-        if (!(result instanceof Map<?,?> resultMap)) return false;
+        String status = String.valueOf(obj.getOrDefault("status", ""));
+
+        if (!"success".equals(status)) {
+            String msg = String.valueOf(obj.getOrDefault("msg", "Unknown error from Python"));
+            log.warn("Task {} returned failure status from Python: {}", key, msg);
+            return false;
+        }
+
+        Object result = obj.get("result");
+        if (!(result instanceof Map<?, ?> resultMap)) {
+            log.warn("Task {} result not valid JSON object", key);
+            return false;
+        }
+
         Object recognizedRaw = resultMap.get("recognized");
-        if (!(recognizedRaw instanceof List<?> recognizedList)) return false;
+        if (!(recognizedRaw instanceof List<?> recognizedList)) {
+            log.warn("Task {} missing recognized field or invalid type", key);
+            return false;
+        }
 
         List<String> vectorIds = new ArrayList<>();
         List<Long> productIds = new ArrayList<>();
@@ -110,15 +125,12 @@ public class RedisTaskConsumer {
             return false;
         }
 
-        // 删除旧向量
         List<String> vectorIdsToDelete = queryVectorIdsByProductIds(new ArrayList<>(idsToDelete));
         batchDeleteByVectorIds(vectorIdsToDelete);
 
-        // 插入新向量
-        boolean success = batchInsertVectors(vectorIds, productIds, vectors, imageTypes);
-//        logFailedProducts(obj);
-        return success;
+        return batchInsertVectors(vectorIds, productIds, vectors, imageTypes);
     }
+
 
     private List<String> queryVectorIdsByProductIds(List<Long> productIds) {
         List<String> vectorIds = new ArrayList<>();
