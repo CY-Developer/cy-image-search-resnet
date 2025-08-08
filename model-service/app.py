@@ -1,134 +1,74 @@
-import os
-import uuid
-import json
-import io
-import logging
-import traceback
-import pickle
-import redis
+"""
+app.py
+~~~~~~
 
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
-from typing import List
-from PIL import Image
+FastAPI 应用入口，为外部提供向量化接口。该服务只负责生成图片向量，不直接
+与 Milvus 交互，保持与现有 Java→Python→Milvus 流程兼容。使用 `ImageEmbeddingService`
+处理图片，并利用 Redis 缓存结果。
 
-from model import OpenCLIPFeatureExtractor
-from utils_fast import multi_scale_preprocess
+提供的主要端点：
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+* `GET /ping`：健康检查，返回 pong。
+* `POST /v1/feature`：输入 Base64 图片、可选类别，返回向量和水印概率。
 
-# 环境变量配置
-API_KEY = os.getenv("API_KEY", "93c1240be757f04a38c2aeb7e5cd7178")
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+请求必须包含有效的 `apiKey`，否则返回 401。若配置未设置 API_KEYS 或为空，则跳过验证。
+"""
 
-app = FastAPI(title="Image Vectorization Service")
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=False)
-extractor = OpenCLIPFeatureExtractor()  # 使用 CPU，默认加载
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel, Field
+from typing import Optional, List
 
-@app.middleware("http")
-async def api_key_middleware(request: Request, call_next):
-    if request.url.path.startswith(("/extract", "/extract-batch", "/batch-result")):
-        if request.headers.get("X-API-Key") != API_KEY:
-            return JSONResponse(status_code=403, content={"error": "Invalid API Key"})
-    return await call_next(request)
+from .config import Config
+from .service import ImageEmbeddingService
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
 
-@app.post("/extract")
-async def extract_vector(file: UploadFile = File(...)):
+app = FastAPI(title="Vectorization Model Service", version="2.0")
+
+# 初始化服务实例
+config = Config()
+service = ImageEmbeddingService(config=config)
+
+
+class ImageFeatureRequest(BaseModel):
+    """请求体定义。"""
+    apiKey: str = Field(..., description="API 密钥")
+    imageBase64: str = Field(..., description="Base64 编码的图片数据")
+    category: Optional[str] = Field("", description="商品类别，可用于裁剪策略")
+
+
+class ImageFeatureResponse(BaseModel):
+    code: int
+    message: str
+    vector: List[float]
+    watermark_prob: float
+
+
+def check_api_key(api_key: str) -> None:
+    """校验 API 密钥。如果配置中没有设置，则允许任意键。"""
+    if config.API_KEYS and api_key not in config.API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid apiKey")
+
+
+@app.get("/ping")
+def ping() -> dict:
+    """健康检查接口。"""
+    return {"message": "pong"}
+
+
+@app.post("/v1/feature", response_model=ImageFeatureResponse)
+def get_feature(req: ImageFeatureRequest) -> ImageFeatureResponse:
+    """生成图片向量并返回。"""
+    # 校验 API 密钥
+    check_api_key(req.apiKey)
     try:
-        data = await file.read()
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        preprocessed = multi_scale_preprocess(img)
-        vectors = [extractor(im) for im in preprocessed]
-        return {
-            "status": "success",
-            "vector": vectors[0],
-            "vectors": vectors
-        }
+        emb, prob = service.embed_from_base64(req.imageBase64, req.category or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Extract error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/extract-batch")
-async def extract_batch(
-        product_id: str = Form(...),
-        main_image: UploadFile = File(...),
-        additional_images: List[UploadFile] = File([]),
-        detail_images: List[UploadFile] = File([]),
-        category: str = Form(...),
-        bg: BackgroundTasks = None
-):
-    task_id = str(uuid.uuid4())
-    payload = {
-        "product_id": product_id,
-        "main": await main_image.read(),
-        "additional": [await f.read() for f in additional_images],
-        "detail": [await f.read() for f in detail_images]
-    }
-    redis_client.setex(f"task:{task_id}:req", 3600, pickle.dumps(payload))
-    bg.add_task(process_batch, task_id)
-    return {"task_id": task_id}
-
-@app.get("/batch-result")
-async def batch_result(task_id: str):
-    try:
-        data = redis_client.get(f"task:{task_id}:res")
-        if not data:
-            raise HTTPException(status_code=404, detail="Result not ready")
-        return json.loads(data.decode('utf-8'))
-    except Exception as e:
-        logger.error(f"Batch result error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch result")
-
-def process_batch(task_id: str):
-    try:
-        raw = redis_client.get(f"task:{task_id}:req")
-        if not raw:
-            raise Exception("No task data in Redis")
-        payload = pickle.loads(raw)
-        product_id = payload["product_id"]
-
-        vecs = []
-        images = [("main", 0, payload["main"])] + \
-                 [("additional", i, b) for i, b in enumerate(payload["additional"])] + \
-                 [("detail", i, b) for i, b in enumerate(payload["detail"])]
-
-        for img_type, index, image_bytes in images:
-            try:
-                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                preprocessed = multi_scale_preprocess(img)
-                for im in preprocessed:
-                    vec = extractor(im)
-                    vecs.append(vec)
-            except Exception as e:
-                logger.warning(f"{img_type} image {index} failed: {e}")
-
-        if not vecs:
-            raise Exception("No vectors extracted")
-
-        redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
-            "status": "success",
-            "result": {
-                "recognized": [{
-                    "product_id": product_id,
-                    "vector": vecs[0],
-                    "vectors": vecs
-                }]
-            }
-        }))
-        logger.info(f"Task {task_id} completed with {len(vecs)} vectors")
-
-    except Exception as e:
-        logger.error(f"Fatal error in batch: {e}\n{traceback.format_exc()}")
-        redis_client.setex(f"task:{task_id}:res", 3600, json.dumps({
-            "status": "fail",
-            "msg": str(e)
-        }))
-    finally:
-        redis_client.delete(f"task:{task_id}:req")
+        raise HTTPException(status_code=500, detail=f"内部错误: {e}")
+    return ImageFeatureResponse(
+        code=0,
+        message="success",
+        vector=emb.astype(float).tolist(),
+        watermark_prob=float(prob)
+    )
