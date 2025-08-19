@@ -1,18 +1,17 @@
-FROM python:3.9-slim-buster
+FROM python:3.10-slim
 
-# ========== 系统依赖 ==========
-RUN sed -i \
-    -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
-    -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
-    /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-      build-essential \
-      libgl1-mesa-glx      \
-      git \
-      && rm -rf /var/lib/apt/lists/*
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
+# 仅训练所需库（不装浏览器）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1-mesa-glx git \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/model-project
+
+# 安装依赖（requirements.txt 里已加 pandas）
 # ========== Python 依赖 ==========
 COPY requirements.txt .
 RUN pip install -i https://mirrors.aliyun.com/pypi/simple --timeout 120 -r requirements.txt

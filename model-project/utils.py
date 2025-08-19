@@ -1,3 +1,4 @@
+
 """
 utils.py
 ~~~~~~~~
@@ -9,6 +10,7 @@ utils.py
 
 from typing import List, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -41,3 +43,48 @@ def extract_embeddings(model: MultiTaskModel, dataset: ProductDataset, batch_siz
         all_product_ids.extend(product_ids)
     embeddings = torch.cat(all_embeddings, dim=0)
     return all_product_ids, embeddings
+
+
+@torch.no_grad()
+def evaluate_retrieval(model: MultiTaskModel, query_dataset: ProductDataset, gallery_dataset: ProductDataset,
+                       device: str = "cpu", top_ks=(1, 5, 10)):
+    """
+    简易检索评估：计算 Recall@K 和 mAP（基于 Cosine 相似度）。
+    这里假定同 product_id 为正样本。
+    """
+    model.eval()
+    q_ids, q_emb = extract_embeddings(model, query_dataset, batch_size=64, device=device)
+    g_ids, g_emb = extract_embeddings(model, gallery_dataset, batch_size=64, device=device)
+
+    q = q_emb.numpy()
+    g = g_emb.numpy()
+    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+    g = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-12)
+
+    sims = np.matmul(q, g.T)  # [Q, G]
+
+    correct_at_k = {k: 0 for k in top_ks}
+    APs = []
+
+    for i, q_pid in enumerate(q_ids):
+        order = np.argsort(-sims[i])  # 大到小
+        ranked_pids = [g_ids[j] for j in order]
+
+        # Recall@K
+        for k in top_ks:
+            if q_pid in ranked_pids[:k]:
+                correct_at_k[k] += 1
+
+        # AP/mAP
+        hits = 0
+        precisions = []
+        for rank, pid in enumerate(ranked_pids, start=1):
+            if pid == q_pid:
+                hits += 1
+                precisions.append(hits / rank)
+        APs.append(np.mean(precisions) if precisions else 0.0)
+
+    recall = {k: correct_at_k[k] / max(1, len(q_ids)) for k in top_ks}
+    mAP = float(np.mean(APs)) if APs else 0.0
+    # 返回常用指标：R@1、R@5、mAP
+    return recall.get(1, 0.0), recall.get(5, 0.0), mAP
