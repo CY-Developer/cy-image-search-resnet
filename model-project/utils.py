@@ -1,90 +1,111 @@
-
 """
-utils.py
-~~~~~~~~
+Utility functions for watermark mask processing and PSD handling.
 
-提供一些辅助函数，例如计算图片嵌入向量、构建向量索引以及查询相似商品。
+This module provides helpers to generate binary masks from PNG or PSD files.
 
-当前仅实现简单的特征提取函数，可在模型训练完成后使用。未来可以结合 FAISS 等库建立高效检索索引。
+``load_global_mask`` loads a watermark image with transparency and
+converts the alpha channel (or grayscale intensity) to a binary mask
+based on a given threshold. The resulting mask is a PIL Image in mode
+"L" with pixel values 0 (no watermark) or 1 (watermark).
+
+For PSD files, Pillow does not support direct alpha extraction. If
+``psd-tools`` is installed, ``load_psd_mask`` can be used to read the
+alpha channel from a PSD. Otherwise, users should convert the PSD to
+PNG offline.
 """
 
-from typing import List, Tuple
+from __future__ import annotations
 
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
+from typing import Optional
 
-from dataset import ProductDataset
-from model import MultiTaskModel
+from PIL import Image
+
+try:
+    from psd_tools import PSDImage  # optional
+    _PSD_AVAILABLE = True
+except ImportError:
+    _PSD_AVAILABLE = False
 
 
-@torch.no_grad()
-def extract_embeddings(model: MultiTaskModel, dataset: ProductDataset, batch_size: int = 64, device: str = "cpu") -> Tuple[List[str], torch.Tensor]:
-    """提取数据集中所有图片的嵌入向量。
+def load_global_mask(path: str, alpha_threshold: float = 0.5) -> Image.Image:
+    """Load a global watermark image and produce a binary mask.
 
-    参数：
-        model: 训练好的多任务模型。
-        dataset: 包含所有图片的 ProductDataset。
-        batch_size: 批处理大小。
-        device: 使用的设备（"cpu" 或 "cuda"）。
+    Parameters
+    ----------
+    path: str
+        Path to the watermark image. Supported formats include PNG with
+        transparency (RGBA or LA) or standard image formats (RGB, L).
+    alpha_threshold: float, optional
+        Alpha threshold in [0,1]. Pixels with alpha greater than this
+        threshold are considered watermark (mask value 1). If the image
+        lacks an alpha channel, grayscale intensity is used instead.
 
-    返回：
-        product_ids: 按顺序排列的商品编号列表。
-        embeddings: 对应图片的嵌入张量，形状为 [N, embedding_dim]。
+    Returns
+    -------
+    PIL.Image.Image
+        A grayscale image (mode "L") with values 0 or 1. 1 indicates
+        watermark region.
     """
-    model.eval()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    all_embeddings: List[torch.Tensor] = []
-    all_product_ids: List[str] = []
-    for images, product_ids, _, _ in loader:
-        images = images.to(device)
-        emb, _ = model(images)
-        all_embeddings.append(emb.cpu())
-        all_product_ids.extend(product_ids)
-    embeddings = torch.cat(all_embeddings, dim=0)
-    return all_product_ids, embeddings
+    img = Image.open(path)
+    # Extract alpha or grayscale
+    if img.mode in ("RGBA", "LA"):
+        alpha = img.getchannel("A")
+    elif img.mode == "P":
+        # Palette mode may have transparency info in info['transparency']
+        if "transparency" in img.info:
+            transparency = img.info["transparency"]
+            # convert palette to RGBA then extract alpha
+            img_rgba = img.convert("RGBA")
+            alpha = img_rgba.getchannel("A")
+        else:
+            # no transparency; treat full intensity as watermark
+            alpha = img.convert("L")
+    else:
+        # Fallback: convert to grayscale and treat intensity as alpha
+        alpha = img.convert("L")
+    # Normalize alpha to [0,1]
+    alpha_f = alpha.point(lambda p: p / 255.0)
+    # Apply threshold
+    mask = alpha_f.point(lambda p: 1 if p > alpha_threshold else 0)
+    mask = mask.convert("L")
+    return mask
 
 
-@torch.no_grad()
-def evaluate_retrieval(model: MultiTaskModel, query_dataset: ProductDataset, gallery_dataset: ProductDataset,
-                       device: str = "cpu", top_ks=(1, 5, 10)):
+def load_psd_mask(path: str, alpha_threshold: float = 0.5) -> Image.Image:
+    """Extract a watermark mask from a PSD file, if psd-tools is available.
+
+    Parameters
+    ----------
+    path: str
+        Path to the PSD file.
+    alpha_threshold: float
+        Threshold for alpha channel.
+
+    Returns
+    -------
+    PIL.Image.Image
+        A grayscale mask image (0/1) of the same size as the PSD.
+
+    Raises
+    ------
+    ImportError
+        If psd-tools is not installed.
+    RuntimeError
+        If PSD file has no alpha channel.
     """
-    简易检索评估：计算 Recall@K 和 mAP（基于 Cosine 相似度）。
-    这里假定同 product_id 为正样本。
-    """
-    model.eval()
-    q_ids, q_emb = extract_embeddings(model, query_dataset, batch_size=64, device=device)
-    g_ids, g_emb = extract_embeddings(model, gallery_dataset, batch_size=64, device=device)
-
-    q = q_emb.numpy()
-    g = g_emb.numpy()
-    q = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
-    g = g / (np.linalg.norm(g, axis=1, keepdims=True) + 1e-12)
-
-    sims = np.matmul(q, g.T)  # [Q, G]
-
-    correct_at_k = {k: 0 for k in top_ks}
-    APs = []
-
-    for i, q_pid in enumerate(q_ids):
-        order = np.argsort(-sims[i])  # 大到小
-        ranked_pids = [g_ids[j] for j in order]
-
-        # Recall@K
-        for k in top_ks:
-            if q_pid in ranked_pids[:k]:
-                correct_at_k[k] += 1
-
-        # AP/mAP
-        hits = 0
-        precisions = []
-        for rank, pid in enumerate(ranked_pids, start=1):
-            if pid == q_pid:
-                hits += 1
-                precisions.append(hits / rank)
-        APs.append(np.mean(precisions) if precisions else 0.0)
-
-    recall = {k: correct_at_k[k] / max(1, len(q_ids)) for k in top_ks}
-    mAP = float(np.mean(APs)) if APs else 0.0
-    # 返回常用指标：R@1、R@5、mAP
-    return recall.get(1, 0.0), recall.get(5, 0.0), mAP
+    if not _PSD_AVAILABLE:
+        raise ImportError(
+            "psd-tools is required to load PSD files; install psd-tools or convert the PSD to PNG."
+        )
+    psd = PSDImage.open(path)
+    # Attempt to find a layer containing transparency (alpha)
+    # This is a heuristic: we search for the first layer with a non-zero alpha channel.
+    for layer in psd:
+        if layer.has_transparency():
+            # layer.topil returns RGBA
+            img_rgba = layer.topil()
+            alpha = img_rgba.getchannel("A")
+            alpha_f = alpha.point(lambda p: p / 255.0)
+            mask = alpha_f.point(lambda p: 1 if p > alpha_threshold else 0).convert("L")
+            return mask
+    raise RuntimeError("No layer with transparency found in PSD")

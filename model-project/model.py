@@ -1,94 +1,93 @@
 """
-model.py
-~~~~~~~~~
+Multi-task neural network model for e-commerce image retrieval with watermark detection.
 
-定义用于商品图片检索与水印分类的多任务神经网络模型。模型基于预训练 ResNet50，
-通过共享骨干提取通用特征，并在此之上分别构建嵌入分支和水印分类分支。
+This module defines the ``MultiTaskResNet`` class, which wraps an
+ImageNet-pretrained ResNet-50 backbone and adds three heads:
 
-嵌入分支输出归一化的特征向量，用于 Triplet/对比损失训练；
-分类分支输出单个 logits，用于判断图片是否带水印。
+1. **Embedding head**: Projects backbone features into a low-dimensional
+   space suitable for metric learning. A BatchNorm layer follows the
+   linear projection. L2 normalization can be applied optionally.
+2. **Category classification head**: Outputs logits for product categories.
+3. **Watermark detection head**: Outputs a single logit indicating whether
+   the input image contains a watermark. Binary cross-entropy with logits
+   should be used as the corresponding loss.
 
+The model returns a tuple ``(embeddings, category_logits, watermark_logits)``.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.models import resnet50, ResNet50_Weights
 
 
-class MultiTaskModel(nn.Module):
-    """多任务模型：商品嵌入 + 水印分类。
-
-    参数：
-        embedding_dim: 嵌入向量维度。
-        backbone: 预训练骨干模型名，默认为 'resnet50'。
-        pretrained: 是否加载 ImageNet 预训练权重。
-        input_channels: 输入通道数，默认 4（RGB+Mask）。
-        use_mask_gating: 是否启用掩模 gating（将掩模区域像素抑制为 0）。
-
-    输出：
-        embeddings: 经过 L2 归一化的特征向量。
-        watermark_logits: 水印分类的原始 logits（未经过 sigmoid）。
-    """
-
+class MultiTaskResNet(nn.Module):
     def __init__(
-            self,
-            backbone: str = "resnet50",
-            embedding_dim: int = 256,
-            input_channels: int = 4,
-            use_mask_gating: bool = True,
-            pretrained: bool = True,
+        self,
+        embed_dim: int,
+        num_categories: int,
+        pretrained: bool = True,
+        l2_norm: bool = True,
     ):
-        super(MultiTaskModel, self).__init__()
-        self.use_mask_gating = use_mask_gating
+        """
+        Initialize the multi-task ResNet model.
 
-        # 新式 weights 写法，兼容 torchvision >= 0.13
-        if backbone == "resnet50":
-            weights = ResNet50_Weights.DEFAULT if pretrained else None
-            resnet = resnet50(weights=weights)
+        Parameters
+        ----------
+        embed_dim: int
+            Dimensionality of the output embedding vector.
+        num_categories: int
+            Number of product categories.
+        pretrained: bool
+            If True, load ImageNet-pretrained weights for the ResNet backbone.
+        l2_norm: bool
+            If True, apply L2 normalization to the embedding vectors.
+        """
+        super().__init__()
+        # Load ResNet-50 backbone
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        backbone = resnet50(weights=weights)
+        in_features = backbone.fc.in_features
+        backbone.fc = nn.Identity()
+        self.backbone = backbone
+        self.l2_norm = l2_norm
 
-            # 若输入通道不是3，则扩展第一层卷积
-            if input_channels != 3:
-                old_conv = resnet.conv1
-                new_conv = nn.Conv2d(
-                    input_channels,
-                    old_conv.out_channels,
-                    kernel_size=old_conv.kernel_size,
-                    stride=old_conv.stride,
-                    padding=old_conv.padding,
-                    bias=(old_conv.bias is not None),
-                )
-                with torch.no_grad():
-                    # 复制前三个通道的预训练权重
-                    new_conv.weight[:, :3, :, :] = old_conv.weight
-                    # 其余通道置零
-                    if input_channels > 3:
-                        new_conv.weight[:, 3:, :, :] = 0.0
-                    if old_conv.bias is not None:
-                        new_conv.bias = old_conv.bias
-                resnet.conv1 = new_conv
-
-            modules = list(resnet.children())[:-1]
-            self.feature_extractor = nn.Sequential(*modules)
-            in_features = resnet.fc.in_features
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
-
-        # 嵌入分支 + 水印分类分支（单 logit，配合 BCEWithLogitsLoss）
-        self.fc = nn.Linear(in_features, embedding_dim)
-        self.classifier = nn.Linear(embedding_dim, 1)
+        # Embedding head: Linear + BatchNorm
+        self.embed_head = nn.Sequential(
+            nn.Linear(in_features, embed_dim, bias=True),
+            nn.BatchNorm1d(embed_dim),
+        )
+        # Category classification head
+        self.category_head = nn.Linear(in_features, num_categories)
+        # Watermark detection head (binary classification)
+        self.watermark_head = nn.Linear(in_features, 1)
 
     def forward(self, x: torch.Tensor):
-        # 掩模 gating：对 RGB 三通道在 mask=1 的区域置零，保留第四通道作为提示
-        if self.use_mask_gating and x.dim() == 4 and x.size(1) >= 4:
-            rgb = x[:, :3, :, :]
-            mask = x[:, 3:4, :, :].clamp(0, 1)
-            rgb = rgb * (1.0 - mask)
-            x = torch.cat([rgb, mask], dim=1)
+        """
+        Forward pass through the model.
 
-        x = self.feature_extractor(x)      # [N, C, 1, 1]
-        x = x.flatten(1)                   # [N, C]
-        embeddings = self.fc(x)            # [N, D]
-        embeddings = F.normalize(embeddings, dim=1)  # L2 归一化，便于检索
-        logits = self.classifier(embeddings).squeeze(1)  # [N]
-        return embeddings, logits
+        Parameters
+        ----------
+        x: torch.Tensor
+            Input tensor of shape (B, C, H, W).
+
+        Returns
+        -------
+        embeddings: torch.Tensor
+            Tensor of shape (B, embed_dim). Normalized if ``l2_norm`` is True.
+        cat_logits: torch.Tensor
+            Tensor of shape (B, num_categories) with raw class scores.
+        wm_logits: torch.Tensor
+            Tensor of shape (B, 1) with raw scores for watermark detection.
+        """
+        feats = self.backbone(x)
+        # Embedding
+        emb = self.embed_head(feats)
+        if self.l2_norm:
+            emb = nn.functional.normalize(emb, dim=1)
+        # Category logits
+        cat_logits = self.category_head(feats)
+        # Watermark logits
+        wm_logits = self.watermark_head(feats)
+        return emb, cat_logits, wm_logits.squeeze(-1)
