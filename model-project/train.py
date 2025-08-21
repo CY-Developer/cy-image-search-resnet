@@ -29,6 +29,32 @@ from .dataset import EcommerceDataset
 from .sampler import PKSampler
 from .model import MultiTaskResNet
 from .losses import BatchHardTripletLoss
+import torchvision.transforms as T
+
+def watermark_invariance_loss(embeddings: torch.Tensor, prod_labels: torch.Tensor, wm_labels: torch.Tensor) -> torch.Tensor:
+    """
+    Encourage embeddings of the same product under different watermark states to be similar.
+
+    Parameters
+    ----------
+    embeddings : Tensor (B,D), L2-normalized embeddings
+    prod_labels : Tensor (B,), product labels
+    wm_labels : Tensor (B,), watermark labels (0 for clean, 1 for watermarked)
+
+    Returns
+    -------
+    Tensor: scalar loss = mean(1 - cos_sim) over pairs of the same product with different watermark labels
+    """
+    with torch.no_grad():
+        same_prod = prod_labels.unsqueeze(1).eq(prod_labels.unsqueeze(0))
+        diff_wm = wm_labels.unsqueeze(1).ne(wm_labels.unsqueeze(0))
+        mask = same_prod & diff_wm
+        mask = torch.triu(mask, diagonal=1)
+    if mask.sum() == 0:
+        return embeddings.new_tensor(0.0)
+    # Cosine similarity; embeddings assumed normalized
+    sim = embeddings @ embeddings.t()
+    return (1.0 - sim[mask]).mean()
 
 
 def set_seed(seed: int) -> None:
@@ -113,6 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category_col", default="category", help="CSV column name for category")
     parser.add_argument("--image_col", default="image_path", help="CSV column name for image path")
     parser.add_argument("--mask_col", default="mask_path", help="CSV column name for mask path")
+    parser.add_argument("--wm_col", default="wm_mask_path", help="CSV column name for watermarked image path")
     parser.add_argument("--mask_suffix", default="_mask.png", help="Suffix to infer mask path when mask_col missing or empty")
     parser.add_argument("--global_watermark_path", default=None, help="Path to global watermark image (PNG with alpha)")
     parser.add_argument("--alpha_threshold", type=float, default=0.5, help="Alpha threshold for global watermark")
@@ -124,6 +151,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--margin", type=float, default=0.2, help="Margin for triplet loss; use None for softplus variant")
     parser.add_argument("--lambda_cat", type=float, default=0.5, help="Weight for category classification loss")
     parser.add_argument("--lambda_wm", type=float, default=1.0, help="Weight for watermark classification loss")
+    parser.add_argument("--lambda_inv", type=float, default=0.3, help="Weight for watermark invariance loss")
+    parser.add_argument("--prefer_s01_ratio", type=float, default=0.5, help="Fraction of classes per batch drawn from S01 cohort")
+    parser.add_argument("--use_aug", action="store_true", help="Enable stronger data augmentation (RandomResizedCrop, ColorJitter, RandomErasing)")
+    parser.add_argument("--use_cosine_lr", action="store_true", help="Use cosine annealing learning rate scheduler")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="Device to train on")
@@ -150,6 +181,18 @@ def main():
     else:
         device = torch.device("cpu")
 
+    # Build data augmentation for training if requested
+    train_transform: Optional[T.Compose] = None
+    if args.use_aug:
+        # Stronger augmentation: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomErasing
+        train_transform = T.Compose([
+            T.RandomResizedCrop(224, scale=(0.6, 1.0), ratio=(0.75, 1.3333), interpolation=T.InterpolationMode.BILINEAR),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            T.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0.0),
+        ])
     # Dataset and DataLoader
     train_ds = EcommerceDataset(
         csv_path=args.csv_path,
@@ -158,12 +201,23 @@ def main():
         product_col=args.product_col,
         category_col=args.category_col,
         mask_col=args.mask_col,
+        wm_col=args.wm_col,
         mask_suffix=args.mask_suffix,
         global_watermark_path=args.global_watermark_path,
         alpha_threshold=args.alpha_threshold,
         mask_gating=not args.no_mask_gating,
+        transform=train_transform,
     )
-    sampler = PKSampler(train_ds.labels, P=args.batch_p, K=args.batch_k, shuffle=True)
+    # Build sampler with optional S01 preference
+    prefer_labels = getattr(train_ds, "s01_label_set", None)
+    sampler = PKSampler(
+        train_ds.labels,
+        P=args.batch_p,
+        K=args.batch_k,
+        shuffle=True,
+        prefer_labels=prefer_labels,
+        prefer_ratio=args.prefer_s01_ratio,
+    )
     batch_size = args.batch_p * args.batch_k
     train_loader = DataLoader(
         train_ds,
@@ -182,6 +236,7 @@ def main():
             product_col=args.product_col,
             category_col=args.category_col,
             mask_col=args.mask_col,
+            wm_col=args.wm_col,
             mask_suffix=args.mask_suffix,
             global_watermark_path=args.global_watermark_path,
             alpha_threshold=args.alpha_threshold,
@@ -224,12 +279,17 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    # Optional cosine annealing scheduler
+    scheduler = None
+    if args.use_cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_triplet = 0.0
         running_cat = 0.0
         running_wm = 0.0
+        running_inv = 0.0
         num_batches = 0
         for imgs, prod_labels, cat_labels, wm_labels in train_loader:
             imgs = imgs.to(device, non_blocking=True)
@@ -242,23 +302,33 @@ def main():
                 t_loss = triplet_loss_fn(emb, prod_labels)
                 c_loss = cat_loss_fn(cat_logits, cat_labels)
                 w_loss = wm_loss_fn(wm_logits, wm_labels)
-                loss = t_loss + args.lambda_cat * c_loss + args.lambda_wm * w_loss
+                # compute cross-watermark invariance loss
+                inv_loss = watermark_invariance_loss(emb, prod_labels, wm_labels)
+                loss = (
+                    t_loss
+                    + args.lambda_cat * c_loss
+                    + args.lambda_wm * w_loss
+                    + args.lambda_inv * inv_loss
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             running_triplet += t_loss.item()
             running_cat += c_loss.item()
             running_wm += w_loss.item()
+            running_inv += inv_loss.item()
             num_batches += 1
         # Compute average losses
         avg_triplet = running_triplet / max(num_batches, 1)
         avg_cat = running_cat / max(num_batches, 1)
         avg_wm = running_wm / max(num_batches, 1)
+        avg_inv = running_inv / max(num_batches, 1)
         log = {
             "epoch": epoch,
             "train_triplet": avg_triplet,
             "train_cat": avg_cat,
             "train_wm": avg_wm,
+            "train_inv": avg_inv,
         }
         # Evaluate
         if val_loader is not None:
@@ -289,6 +359,10 @@ def main():
             }
             ckpt_path = os.path.join(args.outdir, f"model_epoch_{epoch}.pth")
             torch.save(ckpt, ckpt_path)
+
+        # Step scheduler if used
+        if scheduler is not None:
+            scheduler.step()
 
     print(json.dumps({"best_top1": best_top1}, ensure_ascii=False))
 

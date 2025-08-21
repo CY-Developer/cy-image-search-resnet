@@ -9,17 +9,29 @@ reducing noise in the embedding space.
 
 CSV columns expected by default:
 
-* ``image_path``: path to the image file (relative to ``image_root`` or absolute).
+* ``image_path``: path to the clean (non-watermarked) image file (relative to
+  ``image_root`` or absolute). If empty, no clean sample is generated from
+  this row.
 * ``product_id``: identifier grouping images of the same product.
 * ``category``: the category/class of the product.
-* ``mask_path`` (optional): path to a binary mask image. White (255) denotes
-  watermark regions and black (0) denotes clean regions. If missing or empty,
-  the sample is considered free of watermark (unless global_mask is used).
+* ``mask_path`` (optional): path to a binary mask image for the *clean* image.
+  White (255) denotes watermark regions and black (0) denotes clean regions.
+  If missing or empty, gating falls back to the global watermark mask only.
+* ``wm_mask_path`` (optional; configurable via ``wm_col``): **path to the
+  watermarked version of the image**, not a mask. When populated, the
+  dataset will generate an additional sample for this row marked as
+  watermarked.  The confusing name stems from historical reasons; ``wm_mask_path``
+  actually holds the *watermarked image path*, while ``mask_path`` remains
+  the location of a local binary mask for the clean image.
 
 The dataset returns a tuple ``(image_tensor, product_label, category_label,
-watermark_label)``. ``watermark_label`` is ``1`` if ``mask_path`` exists and
-``0`` otherwise. If ``global_watermark_path`` is provided, gating will still
-use the global mask, but ``watermark_label`` remains based on ``mask_path``.
+watermark_label)``. ``watermark_label`` is ``1`` for samples generated from
+``wm_mask_path`` (the watermarked image) and ``0`` for samples generated
+from ``image_path`` (the clean image).  The presence or absence of a local
+mask file (``mask_path``) does **not** change ``watermark_label``.  If
+``global_watermark_path`` is provided, gating still uses the global mask,
+but ``watermark_label`` remains based solely on whether the sample is a
+clean or watermarked version.
 
 Gating can be disabled via ``mask_gating=False``, in which case the mask is
 ignored and the original image is returned (while watermark labels are still
@@ -30,7 +42,7 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Set, Dict
 
 import torch
 from torch.utils.data import Dataset
@@ -50,106 +62,104 @@ class EcommerceDataset(Dataset):
         product_col: str = "product_id",
         category_col: str = "category",
         mask_col: str = "mask_path",
+        wm_col: Optional[str] = None,
         mask_suffix: str = "_mask.png",
         global_watermark_path: Optional[str] = None,
         alpha_threshold: float = 0.5,
         mask_gating: bool = True,
         transform: Optional[transforms.Compose] = None,
     ):
-        """
-        Initialize the dataset.
 
-        Parameters
-        ----------
-        csv_path: str
-            Path to the CSV file containing dataset annotations.
-        image_root: str
-            Root directory used to resolve relative image paths.
-        image_col: str
-            Name of the CSV column containing image paths.
-        product_col: str
-            Name of the column containing product identifiers.
-        category_col: str
-            Name of the column containing category labels.
-        mask_col: str
-            Name of the column containing paths to local watermark masks. If
-            empty or missing in a row, the sample is treated as having no
-            watermark (``watermark_label=0``) and ``mask_path`` is ignored.
-        mask_suffix: str
-            Suffix appended to ``image_path`` to infer mask path when
-            ``mask_col`` is not present or empty. For example, if
-            ``image_path`` is ``abc.jpg`` and ``mask_suffix`` is ``_mask.png``,
-            the inferred mask path is ``abc_mask.png`` in the same directory.
-        global_watermark_path: Optional[str]
-            Path to a global watermark PNG (or PSD converted to PNG). If
-            provided, a binary mask will be generated from its alpha channel
-            using ``alpha_threshold``. The global mask is combined with
-            local masks using logical OR during gating. ``watermark_label``
-            remains based solely on ``mask_col``.
-        alpha_threshold: float
-            Threshold for converting the global watermark alpha channel into a
-            binary mask. Range [0,1]. Higher values produce smaller masks.
-        mask_gating: bool
-            If True, apply gating by zeroing out pixels in watermark regions.
-        transform: Optional[transforms.Compose]
-            Transform applied to the images before returning. If None,
-            a default ImageNet-style transform (Resize->CenterCrop->ToTensor->Normalize)
-            is used.
-        """
         super().__init__()
         self.image_root = image_root
         self.image_col = image_col
         self.product_col = product_col
         self.category_col = category_col
         self.mask_col = mask_col
+        # Optional name of column containing watermarked image paths. When
+        # provided, the dataset will generate two samples from a single row
+        # whenever both ``image_col`` and ``wm_col`` are populated. If
+        # ``wm_col`` is None, only the clean image is considered.
+        self.wm_col = wm_col
         self.mask_suffix = mask_suffix
         self.mask_gating = mask_gating
 
         self.samples: List[Tuple[str, str, str, Optional[str], int]] = []
-        # Read CSV and populate samples (image_path, product_id, category, mask_path, watermark_label)
+        # Read CSV and populate samples. Each row may yield up to two samples:
+        # a clean image (image_col) and/or a watermarked image (wm_col). The
+        # tuple structure is (image_path, product_id, category, mask_path, wm_label)
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            if self.image_col not in reader.fieldnames:
+            # Validate required columns
+            if self.image_col and self.image_col not in reader.fieldnames:
                 raise ValueError(f"Column {self.image_col} not found in CSV {csv_path}")
+            if self.wm_col and self.wm_col not in reader.fieldnames:
+                raise ValueError(f"Column {self.wm_col} not found in CSV {csv_path}")
             for field in (self.product_col, self.category_col):
                 if field not in reader.fieldnames:
                     raise ValueError(f"Column {field} not found in CSV {csv_path}")
-            # mask_col may be missing entirely; we handle per-row
+            # Iterate rows to create samples
             for row in reader:
-                img_rel = row[self.image_col].strip()
                 prod = row[self.product_col].strip()
                 cat = row[self.category_col].strip()
-                # Determine mask path
-                mask_path: Optional[str] = None
-                # If mask_col exists and row has entry, use it
-                if self.mask_col in row and row[self.mask_col]:
+                # Fetch local mask path from mask_col, if provided
+                mask_path_value: Optional[str] = None
+                if self.mask_col and self.mask_col in row and row[self.mask_col]:
                     candidate = row[self.mask_col].strip()
-                    mask_path = candidate if candidate else None
-                # Fallback: infer mask by suffix
-                if not mask_path and self.mask_suffix:
-                    # Append suffix to base filename without extension
-                    base, ext = os.path.splitext(img_rel)
-                    candidate = f"{base}{self.mask_suffix}"
-                    mask_path = candidate
-                # Compute watermark_label: 1 if mask exists and is file, else 0
-                resolved_mask_path = None
-                if mask_path:
-                    resolved_mask_path = self._resolve_path(mask_path)
-                    if not os.path.isfile(resolved_mask_path):
-                        resolved_mask_path = None
-                wm_label = 1 if resolved_mask_path else 0
-                # Resolve image path
-                img_path = self._resolve_path(img_rel)
-                if not os.path.isfile(img_path):
-                    # Skip if image does not exist
-                    continue
-                self.samples.append((img_path, prod, cat, resolved_mask_path, wm_label))
+                    mask_path_value = candidate if candidate else None
+                # Helper to resolve a given mask candidate using suffix inference
+                def resolve_mask_for(image_rel: str) -> Optional[str]:
+                    """Resolve mask path for a given image relative path."""
+                    # Start from explicit mask_path_value
+                    local_candidate = mask_path_value
+                    # If no explicit mask for this row, try suffix-based inference
+                    if not local_candidate and self.mask_suffix:
+                        base, ext = os.path.splitext(image_rel)
+                        candidate = f"{base}{self.mask_suffix}"
+                        local_candidate = candidate
+                    if local_candidate:
+                        resolved = self._resolve_path(local_candidate)
+                        return resolved if os.path.isfile(resolved) else None
+                    return None
+                # Clean image sample
+                if self.image_col:
+                    img_rel = row[self.image_col].strip()
+                    if img_rel:
+                        img_path = self._resolve_path(img_rel)
+                        if os.path.isfile(img_path):
+                            # Resolve mask for clean image
+                            resolved_mask = resolve_mask_for(img_rel)
+                            # For clean image, wm_label=0
+                            self.samples.append((img_path, prod, cat, resolved_mask, 0))
+                # Watermarked image sample
+                if self.wm_col:
+                    wm_rel = row[self.wm_col].strip() if self.wm_col in row else ""
+                    if wm_rel:
+                        wm_path = self._resolve_path(wm_rel)
+                        if os.path.isfile(wm_path):
+                            # Resolve mask for watermarked image using the same mask inference
+                            resolved_wm_mask = resolve_mask_for(wm_rel)
+                            # For watermarked image, wm_label=1
+                            self.samples.append((wm_path, prod, cat, resolved_wm_mask, 1))
 
         # Build product and category mapping to indices
         product_ids = sorted({s[1] for s in self.samples})
         self.prod2label = {pid: i for i, pid in enumerate(product_ids)}
         categories = sorted({s[2] for s in self.samples})
         self.cat2label = {cat: i for i, cat in enumerate(categories)}
+
+        # Identify S0/S1/S01 cohorts
+        # S0: products with only clean images (wm_label=0)
+        # S1: products with only watermarked images (wm_label=1)
+        # S01: products that have both clean and watermarked images
+        # Build a mapping of product -> set of watermark labels observed
+        prod_wm: Dict[str, Set[int]] = {}
+        for _, prod, _, _, wm_label in self.samples:
+            prod_wm.setdefault(prod, set()).add(wm_label)
+        # Products with both 0 and 1 labels are S01
+        self.s01_products: Set[str] = {p for p, wset in prod_wm.items() if 0 in wset and 1 in wset}
+        # Convert to the corresponding product label indices
+        self.s01_label_set: Set[int] = {self.prod2label[p] for p in self.s01_products}
 
         # Create transforms for images and masks
         if transform is None:

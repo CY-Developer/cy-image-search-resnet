@@ -53,14 +53,15 @@ python train.py \
   --val_csv_path path/to/val.csv \              # 验证集 CSV（可选）
   --image_root path/to/images \                 # 图片根目录
   --epochs 20 \                                 # 训练轮数
-  --batch_p 16 --batch_k 4 \                    # 每批次采样的类别数和每类样本数
+  --batch_p 16 --batch_k 4 \                    # 每批次采样的类别数和每类样本数，这里用的是PK 采样：每个 batch 里抽 P 个商品（product_id），每个商品抽 K 张图；所以 batch size = P × K。
   --embed_dim 512 \                             # 嵌入向量维度
   --lambda_cat 0.5 --lambda_wm 1.0 \            # 分类损失和水印损失权重
-  --global_watermark_path path/to/wm.png \       # 全局水印文件（可选）
+  --global_watermark_path path/to/wm.png \      # 全局水印文件（可选）
   --alpha_threshold 0.5 \                       # 全局水印透明度阈值
   --no_mask_gating \                            # 禁用掩模 gating（调试用）
   --mask_suffix _mask.png \                     # 自动推断掩模文件的后缀
   --device auto \                               # 训练设备：auto/cuda/cpu
+  --resume outputs/stage1/best.pth \            # 阶段二从阶段一的“最佳权重”出发再训练；它不会删除阶段一目录里的其他 .pth，阶段二会在自己的 outdir 里继续保存新的 checkpoint。
   --outdir outputs                              # 模型输出目录
 ```
 
