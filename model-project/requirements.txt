@@ -1,4 +1,17 @@
-torch>=1.13
-torchvision>=0.14
-Pillow>=9.0
-numpy>=1.21
+# ---- Use CPU-only PyTorch wheels (avoid CUDA deps) ----
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
+# ---- Core deep learning stack ----
+torch==2.8.0+cpu
+torchvision==0.23.0+cpu
+
+# ---- Numerical & image IO ----
+numpy>=1.26,<3.0
+pillow>=11,<12
+
+# ---- Data handling for quick_report / metrics ----
+pandas>=2.0,<3.0
+
+# ---- Optional: PSD 支持（若需要从 PSD 里抽水印 Alpha）----
+psd-tools>=1.9,<2.0

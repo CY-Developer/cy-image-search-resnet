@@ -12,6 +12,7 @@ reduce the impact of watermark regions on the embedding space.
 See ``README.md`` for detailed usage and description of command-line
 arguments.
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -25,11 +26,21 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .dataset import EcommerceDataset
-from .sampler import PKSampler
-from .model import MultiTaskResNet
-from .losses import BatchHardTripletLoss
+from dataset import EcommerceDataset
+from sampler import PKSampler
+from model import MultiTaskResNet
+from losses import BatchHardTripletLoss
+# from .dataset import EcommerceDataset
+# from .sampler import PKSampler
+# from .model import MultiTaskResNet
+# from .losses import BatchHardTripletLoss
 import torchvision.transforms as T
+
+from contextlib import nullcontext
+import warnings
+
+warnings.filterwarnings("ignore", message="Initializing zero-element tensors is a no-op")
+
 
 def watermark_invariance_loss(embeddings: torch.Tensor, prod_labels: torch.Tensor, wm_labels: torch.Tensor) -> torch.Tensor:
     """
@@ -75,6 +86,9 @@ def evaluate(model: MultiTaskResNet, loader: DataLoader, device: torch.device) -
     dict with keys: 'top1', 'cat_acc', 'wm_acc', 'num'
     """
     model.eval()
+    # 验证集为空时直接返回 0 指标
+    if hasattr(loader, "dataset") and len(loader.dataset) == 0:
+        return {"top1": 0.0, "cat_acc": 0.0, "wm_acc": 0.0, "num": 0}
     all_embeddings = []
     all_prod_labels = []
     all_cat_labels = []
@@ -94,6 +108,9 @@ def evaluate(model: MultiTaskResNet, loader: DataLoader, device: torch.device) -
             all_wm_labels.append(wm_labels.cpu())
             all_cat_logits.append(cat_logits.cpu())
             all_wm_logits.append(wm_logits.cpu())
+
+    if not all_embeddings:
+            return {"top1": 0.0, "cat_acc": 0.0, "wm_acc": 0.0, "num": 0}
     embeddings = torch.cat(all_embeddings, dim=0)
     prod_labels = torch.cat(all_prod_labels, dim=0)
     cat_labels = torch.cat(all_cat_labels, dim=0)
@@ -208,6 +225,7 @@ def main():
         mask_gating=not args.no_mask_gating,
         transform=train_transform,
     )
+    print(f"[SANITY] train_len={len(train_ds)}")
     # Build sampler with optional S01 preference
     prefer_labels = getattr(train_ds, "s01_label_set", None)
     sampler = PKSampler(
@@ -242,6 +260,7 @@ def main():
             alpha_threshold=args.alpha_threshold,
             mask_gating=not args.no_mask_gating,
         )
+        print(f"[SANITY] val_len={len(val_ds)} from {args.val_csv_path}")
         val_loader = DataLoader(
             val_ds,
             batch_size=batch_size,
@@ -278,7 +297,8 @@ def main():
     wm_loss_fn = nn.BCEWithLogitsLoss()
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    use_cuda_amp = (device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda") if use_cuda_amp else None
     # Optional cosine annealing scheduler
     scheduler = None
     if args.use_cosine_lr:
@@ -297,22 +317,28 @@ def main():
             cat_labels = cat_labels.to(device, non_blocking=True)
             wm_labels = wm_labels.float().to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            amp_ctx = torch.amp.autocast("cuda") if use_cuda_amp else nullcontext()
+            with amp_ctx:
                 emb, cat_logits, wm_logits = model(imgs)
                 t_loss = triplet_loss_fn(emb, prod_labels)
                 c_loss = cat_loss_fn(cat_logits, cat_labels)
                 w_loss = wm_loss_fn(wm_logits, wm_labels)
-                # compute cross-watermark invariance loss
                 inv_loss = watermark_invariance_loss(emb, prod_labels, wm_labels)
                 loss = (
-                    t_loss
-                    + args.lambda_cat * c_loss
-                    + args.lambda_wm * w_loss
-                    + args.lambda_inv * inv_loss
+                        t_loss
+                        + args.lambda_cat * c_loss
+                        + args.lambda_wm * w_loss
+                        + args.lambda_inv * inv_loss
                 )
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+
+            optimizer.zero_grad(set_to_none=True)
+            if use_cuda_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             running_triplet += t_loss.item()
             running_cat += c_loss.item()
             running_wm += w_loss.item()

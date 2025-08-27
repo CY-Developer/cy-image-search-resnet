@@ -37,201 +37,195 @@ Gating can be disabled via ``mask_gating=False``, in which case the mask is
 ignored and the original image is returned (while watermark labels are still
 provided). Global masks are loaded via ``utils.load_global_mask``.
 """
+# 替换 ecommerce_image_retrieval/dataset.py 中的整个 EcommerceDataset 类
 
-from __future__ import annotations
-
-import csv
-import os
+import csv, os
 from typing import List, Tuple, Optional, Set, Dict
-
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from PIL import Image
-
-from .utils import load_global_mask
-
+# from .utils import load_global_mask
+from utils import load_global_mask
 
 class EcommerceDataset(Dataset):
-    def __init__(
-        self,
-        csv_path: str,
-        image_root: str = "",
-        image_col: str = "image_path",
-        product_col: str = "product_id",
-        category_col: str = "category",
-        mask_col: str = "mask_path",
-        wm_col: Optional[str] = None,
-        mask_suffix: str = "_mask.png",
-        global_watermark_path: Optional[str] = None,
-        alpha_threshold: float = 0.5,
-        mask_gating: bool = True,
-        transform: Optional[transforms.Compose] = None,
-    ):
+    """
+    支持的 CSV 列（向后兼容）：
+      - image_path         : 干净/普通图片（可为空；为空则本行不生成 wm=0 样本）
+      - product_id         : 商品ID
+      - category           : 类目
+      - mask_path          : 对应 image_path 的局部掩模（可空，用于 gating，但不决定 wm_label）
+      - wm_image_path      : 水印版图片路径（新增，推荐列名；若你还在用 'wm_mask_path' 存水印图，也能自动识别）
+      - wm_local_mask      : 对应 wm_image_path 的局部掩模（新增，可空；为空则仅用全局掩模）
 
+    展开规则（每行最多生成两条样本）：
+      1) image_path 存在 → 生成一条样本，wm_label=0；若 mask_path 有值则用于 gating
+      2) wm_image_path 存在 → 再生成一条样本，wm_label=1；优先用 wm_local_mask gating，否则退回全局掩模
+    最终自动按商品聚合得到 S0 / S1 / S01 三类，用于 S01 优先采样和跨水印一致性学习。
+    """
+
+    def __init__(
+            self,
+            csv_path: str,
+            image_root: str = "",
+            image_col: str = "image_path",
+            product_col: str = "product_id",
+            category_col: str = "category",
+            mask_col: str = "mask_path",
+            # 推荐使用 wm_image_path / wm_local_mask；若仍使用旧列名 wm_mask_path 表示水印图，也能自动识别
+            wm_col: str = "wm_image_path",
+            wm_mask_col: str = "wm_local_mask",
+            mask_suffix: Optional[str] = None,
+            global_watermark_path: Optional[str] = None,
+            alpha_threshold: float = 0.5,
+            mask_gating: bool = True,
+            transform: Optional[transforms.Compose] = None,
+    ):
         super().__init__()
-        self.image_root = image_root
-        self.image_col = image_col
-        self.product_col = product_col
-        self.category_col = category_col
-        self.mask_col = mask_col
-        # Optional name of column containing watermarked image paths. When
-        # provided, the dataset will generate two samples from a single row
-        # whenever both ``image_col`` and ``wm_col`` are populated. If
-        # ``wm_col`` is None, only the clean image is considered.
-        self.wm_col = wm_col
+        self.root_dir = image_root
+        self.image_col, self.product_col, self.category_col = image_col, product_col, category_col
+        self.mask_col, self.wm_col, self.wm_mask_col = mask_col, wm_col, wm_mask_col
         self.mask_suffix = mask_suffix
         self.mask_gating = mask_gating
 
-        self.samples: List[Tuple[str, str, str, Optional[str], int]] = []
-        # Read CSV and populate samples. Each row may yield up to two samples:
-        # a clean image (image_col) and/or a watermarked image (wm_col). The
-        # tuple structure is (image_path, product_id, category, mask_path, wm_label)
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            # Validate required columns
-            if self.image_col and self.image_col not in reader.fieldnames:
-                raise ValueError(f"Column {self.image_col} not found in CSV {csv_path}")
-            if self.wm_col and self.wm_col not in reader.fieldnames:
-                raise ValueError(f"Column {self.wm_col} not found in CSV {csv_path}")
-            for field in (self.product_col, self.category_col):
-                if field not in reader.fieldnames:
-                    raise ValueError(f"Column {field} not found in CSV {csv_path}")
-            # Iterate rows to create samples
-            for row in reader:
-                prod = row[self.product_col].strip()
-                cat = row[self.category_col].strip()
-                # Fetch local mask path from mask_col, if provided
-                mask_path_value: Optional[str] = None
-                if self.mask_col and self.mask_col in row and row[self.mask_col]:
-                    candidate = row[self.mask_col].strip()
-                    mask_path_value = candidate if candidate else None
-                # Helper to resolve a given mask candidate using suffix inference
-                def resolve_mask_for(image_rel: str) -> Optional[str]:
-                    """Resolve mask path for a given image relative path."""
-                    # Start from explicit mask_path_value
-                    local_candidate = mask_path_value
-                    # If no explicit mask for this row, try suffix-based inference
-                    if not local_candidate and self.mask_suffix:
-                        base, ext = os.path.splitext(image_rel)
-                        candidate = f"{base}{self.mask_suffix}"
-                        local_candidate = candidate
-                    if local_candidate:
-                        resolved = self._resolve_path(local_candidate)
-                        return resolved if os.path.isfile(resolved) else None
-                    return None
-                # Clean image sample
-                if self.image_col:
-                    img_rel = row[self.image_col].strip()
-                    if img_rel:
-                        img_path = self._resolve_path(img_rel)
-                        if os.path.isfile(img_path):
-                            # Resolve mask for clean image
-                            resolved_mask = resolve_mask_for(img_rel)
-                            # For clean image, wm_label=0
-                            self.samples.append((img_path, prod, cat, resolved_mask, 0))
-                # Watermarked image sample
-                if self.wm_col:
-                    wm_rel = row[self.wm_col].strip() if self.wm_col in row else ""
-                    if wm_rel:
-                        wm_path = self._resolve_path(wm_rel)
-                        if os.path.isfile(wm_path):
-                            # Resolve mask for watermarked image using the same mask inference
-                            resolved_wm_mask = resolve_mask_for(wm_rel)
-                            # For watermarked image, wm_label=1
-                            self.samples.append((wm_path, prod, cat, resolved_wm_mask, 1))
+        # 读取 CSV
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            rd = csv.DictReader(f)
+            rows = list(rd)
+            fieldnames = set(rd.fieldnames or [])
 
-        # Build product and category mapping to indices
-        product_ids = sorted({s[1] for s in self.samples})
-        self.prod2label = {pid: i for i, pid in enumerate(product_ids)}
-        categories = sorted({s[2] for s in self.samples})
-        self.cat2label = {cat: i for i, cat in enumerate(categories)}
+        # 兼容旧列名：若没有 wm_image_path 而存在 wm_mask_path，则把它当成“水印图列”
+        if (self.wm_col not in fieldnames) and ("wm_mask_path" in fieldnames):
+            self.wm_col = "wm_mask_path"
+        # wm_local_mask 缺失时就当作没有逐图水印掩模
+        if self.wm_mask_col not in fieldnames:
+            self.wm_mask_col = None
 
-        # Identify S0/S1/S01 cohorts
-        # S0: products with only clean images (wm_label=0)
-        # S1: products with only watermarked images (wm_label=1)
-        # S01: products that have both clean and watermarked images
-        # Build a mapping of product -> set of watermark labels observed
-        prod_wm: Dict[str, Set[int]] = {}
-        for _, prod, _, _, wm_label in self.samples:
-            prod_wm.setdefault(prod, set()).add(wm_label)
-        # Products with both 0 and 1 labels are S01
-        self.s01_products: Set[str] = {p for p, wset in prod_wm.items() if 0 in wset and 1 in wset}
-        # Convert to the corresponding product label indices
+        # 样本：(img_path, product_id, category, wm_label, local_mask_path)
+        self.samples: List[Tuple[str, str, str, int, Optional[str]]] = []
+
+        for r in rows:
+            pid = (r.get(self.product_col) or "").strip()
+            cat = (r.get(self.category_col) or "").strip()
+
+            # 1) 干净样本（wm=0）
+            img_rel = (r.get(self.image_col) or "").strip()
+            if img_rel:
+                img_path = self._resolve(img_rel)
+                if os.path.isfile(img_path):
+                    m_local = None
+                    if self.mask_col in fieldnames:
+                        m_rel = (r.get(self.mask_col) or "").strip()
+                        if m_rel:
+                            m_local = self._resolve(m_rel)
+                    # 可选根据后缀猜掩模（例如 _mask.png）
+                    if (not m_local) and self.mask_suffix:
+                        guess = os.path.splitext(img_path)[0] + self.mask_suffix
+                        if os.path.isfile(guess):
+                            m_local = guess
+                    self.samples.append((img_path, pid, cat, 0, m_local))
+
+            # 2) 水印样本（wm=1）
+            if self.wm_col:
+                wm_img_rel = (r.get(self.wm_col) or "").strip()
+                if wm_img_rel:
+                    wm_img_path = self._resolve(wm_img_rel)
+                    if os.path.isfile(wm_img_path):
+                        wm_local = None
+                        if self.wm_mask_col:
+                            wmm_rel = (r.get(self.wm_mask_col) or "").strip()
+                            if wmm_rel:
+                                wm_local = self._resolve(wmm_rel)
+                        self.samples.append((wm_img_path, pid, cat, 1, wm_local))
+
+        # 编码标签
+        products = sorted({p for _, p, _, _, _ in self.samples})
+        categories = sorted({c for _, _, c, _, _ in self.samples})
+        self.prod2label = {p: i for i, p in enumerate(products)}
+        self.cat2label = {c: i for i, c in enumerate(categories)}
+
+        # 标记 S01 商品集合
+        prod2wm: Dict[str, Set[int]] = {}
+        for _, p, _, w, _ in self.samples:
+            prod2wm.setdefault(p, set()).add(w)
+        self.s01_products: Set[str] = {p for p, s in prod2wm.items() if 0 in s and 1 in s}
         self.s01_label_set: Set[int] = {self.prod2label[p] for p in self.s01_products}
 
-        # Create transforms for images and masks
+        # 变换
         if transform is None:
-            # Default transforms: Resize -> CenterCrop -> ToTensor -> Normalize
             self.transform_img = transforms.Compose([
                 transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
             ])
         else:
             self.transform_img = transform
-        # Mask transform: Resize and CenterCrop, nearest interpolation, to tensor (0/1 values)
+
         self.transform_mask = transforms.Compose([
             transforms.Resize(256, interpolation=InterpolationMode.NEAREST),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
         ])
 
-        # Load global mask if provided
+        # 全局水印掩模（可选）
+        self.global_mask = None
         if global_watermark_path:
             if not os.path.isfile(global_watermark_path):
-                raise FileNotFoundError(f"Global watermark file not found: {global_watermark_path}")
-            gmask_img = load_global_mask(global_watermark_path, alpha_threshold=alpha_threshold)
-            # Apply mask transform and threshold to get values 0/1 (Tensor shape [1, H, W])
-            gmask_tensor = self.transform_mask(gmask_img)
-            # Ensure binary
-            gmask_tensor = (gmask_tensor > 0.5).float()
-            self.global_mask = gmask_tensor  # shape [1,224,224]
-        else:
-            self.global_mask = None
+                raise FileNotFoundError(f"Global watermark not found: {global_watermark_path}")
+            g = load_global_mask(global_watermark_path, alpha_threshold)
+            self.global_mask = (self.transform_mask(g) > 0.5).float()  # [1,H,W]
 
-    def _resolve_path(self, rel_path: str) -> str:
-        """Resolve a path relative to image_root if not absolute."""
-        if os.path.isabs(rel_path) or not self.image_root:
-            return rel_path
-        return os.path.join(self.image_root, rel_path)
+    def _resolve(self, rel: str) -> str:
+        rel = rel.replace("\\", "/").strip()
+        return rel if os.path.isabs(rel) or not self.root_dir else os.path.join(self.root_dir, rel)
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _open_rgb   (self,path: str) -> Image.Image:
+        im = Image.open(path)
+        # P 模式且带透明度 → 先 RGBA，铺白底后回到 RGB
+        if im.mode == "P" and "transparency" in im.info:
+            im = im.convert("RGBA")
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            im = Image.alpha_composite(bg, im).convert("RGB")
+        else:
+            im = im.convert("RGB")
+        return im
+    def _open_mask(self,path: str) -> Image.Image:
+        im = Image.open(path)
+        # 若自带 alpha（RGBA/LA），优先用 alpha 作为掩模
+        if im.mode in ("RGBA", "LA"):
+            return im.split()[-1].convert("L")
+        # P 模式且有透明信息：转 RGBA 后取 alpha
+        if im.mode == "P" and "transparency" in im.info:
+            im = im.convert("RGBA")
+            return im.split()[-1].convert("L")
+        # 普通灰度
+        return im.convert("L")
     def __getitem__(self, idx: int):
-        img_path, prod, cat, mask_path, wm_label = self.samples[idx]
-        # Load image
-        with Image.open(img_path) as img:
-            img = img.convert("RGB")
-        img_tensor = self.transform_img(img)  # shape [3,224,224]
-        # Prepare gating mask if required
+        path, pid, cat, wm, local_mask = self.samples[idx]
+        img = self._open_rgb(path).convert("RGB")
+        x = self.transform_img(img)
+
+        # gating：优先本地掩模，其次全局掩模（干净/水印样本都可用，有就抑制）
         if self.mask_gating:
-            # Start with zeros (no gating)
-            mask_combined = None
-            # Local mask
-            if mask_path:
-                with Image.open(mask_path) as mimg:
-                    mimg = mimg.convert("L")
-                local_mask = self.transform_mask(mimg)
-                local_mask = (local_mask > 0.5).float()  # binary [1,224,224]
-                mask_combined = local_mask if mask_combined is None else torch.max(mask_combined, local_mask)
-            # Global mask
-            if self.global_mask is not None:
-                mask_combined = self.global_mask if mask_combined is None else torch.max(mask_combined, self.global_mask)
-            # If mask exists, apply gating: zero out masked regions
-            if mask_combined is not None:
-                # Expand mask to match channels
-                mask_inv = 1.0 - mask_combined  # shape [1,H,W]
-                img_tensor = img_tensor * mask_inv
-        # Convert labels to indices
-        prod_label = self.prod2label[prod]
-        cat_label = self.cat2label[cat]
-        return img_tensor, prod_label, cat_label, wm_label
+            m = None
+            if local_mask and os.path.isfile(local_mask):
+                try:
+                    m_img = self._open_mask(local_mask).convert("L")
+                    m = (self.transform_mask(m_img) > 0.5).float()
+                except Exception:
+                    m = None
+            if (m is None) and (self.global_mask is not None):
+                m = self.global_mask
+            if m is not None:
+                x = x * (1.0 - m)
+
+        return x, self.prod2label[pid], self.cat2label[cat], wm
 
     @property
     def num_products(self) -> int:
@@ -243,5 +237,4 @@ class EcommerceDataset(Dataset):
 
     @property
     def labels(self) -> List[int]:
-        """Return list of product labels for sampling."""
-        return [self.prod2label[s[1]] for s in self.samples]
+        return [self.prod2label[p] for _, p, _, _, _ in self.samples]
