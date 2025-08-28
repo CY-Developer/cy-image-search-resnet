@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+  # ===================== Stage 1: 主/附图基础收敛（本地 CPU） =====================
+  trainer_cpu_s1:
+    image: python:3.10
+    shm_size: 3g
+    working_dir: /app
+    volumes:
+      - "E:/wrok/app/idea/code/cy-image-search-resnet/model-project:/app"
+    environment:
+      PYTHONPATH: /app
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        pip install --no-cache-dir -r /app/requirements.txt
+        python -u /app/train.py \
+          --csv_path /app/cvs/dummy_stage_one_train.csv \
+          --val_csv_path /app/cvs/dummy_stage_one_verification.csv \
+          --image_root /app \
+          --mask_col mask_path \
+          --global_watermark_path /app/cvs/new_watermark.png \
+          --epochs 20 --batch_p 16 --batch_k 4 \
+          --lambda_cat 0.5 --lambda_wm 1.0 --lambda_inv 0.3 \
+          --prefer_s01_ratio 0.5 \
+          --num_workers 2 --device cpu \
+          --outdir /app/out/stage1
+    profiles: ["cpu"]
+
+
+  # ===================== Stage 2: 并集训练 + 详情/复杂背景（本地 CPU） =====================
+  trainer_cpu_s2:
+    image: python:3.10
+    shm_size: 3g
+    working_dir: /app
+    volumes:
+      - "E:/wrok/app/idea/code/cy-image-search-resnet/model-project:/app"
+    environment:
+      PYTHONPATH: /app
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+          pip install --no-cache-dir -r /app/requirements.txt
+          python -u /app/train.py \
+            --csv_path /app/cvs/dummy_stage_two_train.csv \
+            --val_csv_path /app/cvs/dummy_stage_two_verification.csv \
+            --image_root /app \
+            --mask_col mask_path \
+            --wm_col wm_image_path \
+            --global_watermark_path /app/cvs/new_watermark.png \
+            --epochs 60 --batch_p 16 --batch_k 4 \
+            --lambda_cat 0.6 --lambda_wm 0.6 --lambda_inv 0.4 \
+            --prefer_s01_ratio 0.6 \
+            --num_workers 2 --device cpu \
+            --use_aug --use_cosine_lr \
+            --resume /app/out/stage1/best.pth \
+            --outdir /app/out/s2_e55_wminv
+    profiles: ["cpu"]
+
+  # ===================== 训练后快报评测（本地 CPU） =====================
+  quick_report:
+    image: python:3.10
+    working_dir: /app
+    volumes:
+      - "E:/wrok/app/idea/code/cy-image-search-resnet/model-project:/app"
+      - "E:/wrok/app/idea/code/cy-image-search-resnet/images:/data/images"
+    environment:
+      PYTHONPATH: /app
+    command: |
+      bash -lc "set -e
+        pip install --no-cache-dir -r /app/requirements.txt
+        python /app/quick_report.py \
+          --csv_path /app/cvs/val_stage2.csv \
+          --image_root /data/images \
+          --checkpoint /app/out/stage2/best.pth \
+          --global_watermark_path /app/offline/new_watermark.png
+      "
+    profiles: ["cpu"]
