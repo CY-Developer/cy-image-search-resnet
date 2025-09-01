@@ -21,4 +21,4 @@ RUN pip install -i https://mirrors.aliyun.com/pypi/simple --timeout 120 -r requi
 COPY . .
 
 EXPOSE 5000
-CMD ["uvicorn","app:app","--host","0.0.0.0","--port","5000","--workers","2","--loop","uvloop"]
+CMD ["uvicorn","app:app","--host","0.0.0.0","--port","5000","--loop","asyncio","--http","h11","--workers","1"]

@@ -38,6 +38,19 @@
 
     <dependencies>
         <!-- Spring Boot Web (含 Jackson、Tomcat 等) -->
+        <!-- OkHttp，用于调用 Python 向量化服务 -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
+        <!-- Fastjson 1.x，你的代码是 com.alibaba.fastjson.JSON -->
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+            <version>1.2.83</version>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>

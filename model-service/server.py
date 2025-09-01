@@ -19,8 +19,8 @@ from fastapi import FastAPI, File, UploadFile, Form
 from pydantic import BaseModel
 from PIL import Image
 
-from .model_service import ImageEmbeddingService
-from .config import Config
+from model_service import ImageEmbeddingService
+from config import Config
 
 
 app = FastAPI(title="Image Vectorization Service", version="2.0")

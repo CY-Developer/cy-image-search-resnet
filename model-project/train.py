@@ -283,11 +283,41 @@ def main():
     best_top1 = 0.0
     if args.resume:
         if os.path.isfile(args.resume):
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint.get("model", checkpoint))
-            start_epoch = checkpoint.get("epoch", 1)
-            best_top1 = checkpoint.get("best_top1", 0.0)
-            print(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
+            # 更安全加载；旧版 torch 无 weights_only 时回退
+            try:
+                checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+            except TypeError:
+                checkpoint = torch.load(args.resume, map_location=device)
+
+            ckpt_state = checkpoint.get("model", checkpoint)
+            model_state = model.state_dict()
+
+            # 跳过 head（分类/水印等）+ 只加载形状匹配
+            def _skip_key(k: str) -> bool:
+                return k.startswith("category_head.") or k.startswith("wm_head.")
+
+            filtered, skipped = {}, []
+            for k, v in ckpt_state.items():
+                if _skip_key(k):
+                    skipped.append(k); continue
+                if k in model_state and getattr(model_state[k], "shape", None) == getattr(v, "shape", None):
+                    filtered[k] = v
+                else:
+                    skipped.append(k)
+
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+
+            # 二阶段属于“迁移初始化”，不要沿用上一阶段的 epoch/LR 进度
+            start_epoch = 1
+            best_top1 = 0.0
+
+            def _short(lst, n=8):
+                return ", ".join(lst[:n]) + (f" ...(+{len(lst)-n})" if len(lst) > n else "")
+            print(f"[RESUME] loaded {len(filtered)}/{len(ckpt_state)} tensors.")
+            if skipped:   print("[RESUME] skipped:", _short(skipped))
+            if missing:   print("[RESUME] missing:", _short(missing))
+            if unexpected:print("[RESUME] unexpected:", _short(unexpected))
+            print("Resume in transfer mode (reset epoch/LR).")
         else:
             print(f"Warning: resume checkpoint {args.resume} not found; starting from scratch")
 

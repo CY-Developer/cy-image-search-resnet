@@ -1,26 +1,98 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="zh-CN">
 <head>
-    <title>以图搜图Demo</title>
+    <meta charset="UTF-8" />
+    <title>本地以图搜图（演示版）</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft YaHei", Arial; margin: 24px; }
+        .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 16px; }
+        .card { border: 1px solid #eee; border-radius: 8px; padding: 8px; overflow: hidden; background: #fff; }
+        .card img { width: 100%; height: 180px; object-fit: cover; display: block; border-radius: 6px; background: #f7f7f7; }
+        .title { font-size: 12px; color: #666; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        button { padding: 8px 14px; border-radius: 6px; border: 1px solid #ddd; background: #fafafa; cursor: pointer; }
+        button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+        .muted { color: #888; font-size: 12px; }
+        .preview { width: 160px; height: 160px; border: 1px dashed #ccc; border-radius: 10px; display:flex; align-items:center; justify-content:center; overflow: hidden; }
+        .preview img { width: 100%; height: 100%; object-fit: cover; }
+    </style>
 </head>
 <body>
-<h2>上传商品图片，查看相似商品</h2>
-<form action="/search" method="post" enctype="multipart/form-data">
-    <input type="file" name="file" required />
-    <button type="submit">搜索</button>
-</form>
-<hr/>
-<div>
-    <h3>推荐结果：</h3>
-    <th:block th:if="${results}">
-        <div th:each="item : ${results}">
-            <img th:src="${item.imageUrl}" width="120" style="vertical-align: middle;"/>
-            <span th:text="${item.name}"></span> (SKU: <span th:text="${item.sku}"></span>)
-            相似度：<span th:text="${item.score}"></span>
-            <br/>
-        </div>
-    </th:block>
-    <span th:if="${error}" th:text="${error}"></span>
+<h2>本地以图搜图（演示版）</h2>
+
+<div class="row" style="gap:16px; margin-bottom:12px;">
+    <input type="file" id="file" accept="image/*" />
+    <button id="btnUpload">上传</button>
+    <button id="btnSearch" class="primary">提交查询</button>
+    <span id="msg" class="muted"></span>
 </div>
+
+<div class="row">
+    <div class="preview" id="preview"><span class="muted">预览</span></div>
+</div>
+
+<div id="result" class="grid"></div>
+
+<script>
+    const $ = (s)=>document.querySelector(s);
+    let uploaded = null; // {fileId, filename}
+
+    // 预览
+    $('#file').addEventListener('change', (e)=>{
+        const f = e.target.files?.[0];
+        if(!f){ $('#preview').innerHTML = '<span class="muted">预览</span>'; return; }
+        const url = URL.createObjectURL(f);
+        $('#preview').innerHTML = `<img src="${url}">`;
+    });
+
+    // 上传
+    $('#btnUpload').addEventListener('click', async ()=>{
+        const f = $('#file').files?.[0];
+        if(!f){ $('#msg').textContent = '请先选择图片'; return; }
+        const fd = new FormData();
+        fd.append('file', f);
+        $('#msg').textContent = '上传中...';
+        try{
+            const resp = await fetch('/api/upload', { method:'POST', body: fd });
+            if(!resp.ok) throw new Error('上传失败');
+            uploaded = await resp.json();
+            $('#msg').textContent = `上传成功：${uploaded.filename}`;
+        }catch(err){
+            console.error(err);
+            $('#msg').textContent = '上传失败';
+        }
+    });
+
+    // 提交查询
+    $('#btnSearch').addEventListener('click', async ()=>{
+        $('#msg').textContent = '查询中...';
+        try{
+            const payload = uploaded ? { fileId: uploaded.fileId } : {};
+            const resp = await fetch('/api/search', {
+                method:'POST',
+                headers: { 'Content-Type':'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if(!resp.ok) throw new Error('查询失败');
+            const data = await resp.json(); // [{productId,title,catalogPath,imageUrl}, ...]
+            render(data);
+            $('#msg').textContent = `共 ${data.length} 个结果`;
+        }catch(err){
+            console.error(err);
+            $('#msg').textContent = '查询失败';
+        }
+    });
+
+    function render(items){
+        const html = items.map(it => `
+      <div class="card" title="${it.title || ''}">
+        <img src="${it.imageUrl}" alt="${it.productId}">
+        <div class="title">${it.productId} · ${it.title || ''}</div>
+      </div>
+    `).join('');
+        $('#result').innerHTML = html;
+    }
+</script>
 </body>
-</html>docker compose -f docker-compose.yml restart
+</html>

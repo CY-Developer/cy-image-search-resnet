@@ -14,9 +14,9 @@ from torchvision import transforms
 import redis
 from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
 
-from .config import Config
-from .model import load_model
-from .preprocess import Preprocessor
+from config import Config
+from model import load_model
+from preprocess import Preprocessor
 
 import io
 

@@ -31,6 +31,7 @@ python -V
 pip install -U pip wheel
 # 先装项目依赖（若有）
 [[ -f requirements.txt ]] && pip install -r requirements.txt || true
+pip install -U pandas
 
 # 先检测现有 torch 是否已是 GPU 可用；不可用再按宿主 CUDA 安装对应轮子
 set +e
@@ -96,9 +97,9 @@ python -u "$PROJECT_DIR/train.py" \
   --image_root       "$IMG_ROOT" \
   --mask_col         mask_path \
   --wm_col           wm_image_path \
-  --epochs           40 \
+  --epochs           30 \
   --batch_p          16 \
-  --batch_k          8 \
+  --batch_k          12 \
   --lambda_cat       0.0 \
   --lambda_wm        0.0 \
   --lambda_inv       0.0 \
@@ -119,6 +120,28 @@ else
   echo "[INFO] 未找到全局水印 PNG，跳过 --global_watermark_path（可选）"
 fi
 
+python - <<'PY'
+import os, pandas as pd
+base = os.environ.get("CDIR", "cvs")
+fix = ["dummy_stage_two_train.csv", "dummy_stage_two_verification.csv"]
+for fn in fix:
+    p = os.path.join(base, fn)
+    try:
+        df = pd.read_csv(p)
+    except Exception as e:
+        print(f"[CSV FIX] skip {p}: {e}")
+        continue
+    # 统一类别
+    df["category"] = (
+        df["category"]
+        .astype(str)
+        .replace({"nan":"watch","NaN":"watch","None":"watch","":"watch"})
+        .fillna("watch")
+    )
+    df.to_csv(p, index=False)
+    print("[CSV FIX]", p, "unique categories =", df["category"].nunique(), df["category"].unique()[:5])
+PY
+
 python -u "$PROJECT_DIR/train.py" \
   --csv_path         "$CDIR/dummy_stage_two_train.csv" \
   --val_csv_path     "$CDIR/dummy_stage_two_verification.csv" \
@@ -128,10 +151,10 @@ python -u "$PROJECT_DIR/train.py" \
   $GM \
   --epochs           70 \
   --batch_p          16 \
-  --batch_k          8 \
+  --batch_k          12 \
   --lambda_cat       0.0 \
   --lambda_wm        0.1 \
-  --lambda_inv       0.45 \
+  --lambda_inv       0.40 \
   --prefer_s01_ratio 0.7 \
   --num_workers      12 \
   --device           cuda \
@@ -154,9 +177,11 @@ python "$PROJECT_DIR/quick_report.py" \
   --ckpt       "$ODIR/s2_e70_wminv_prod_gpu/best.pth" \
   --val_csv    "$CDIR/dummy_stage_two_verification.csv" \
   --image_root "$IMG_ROOT" \
-  --device     cuda \
+  --device cuda \
   --batch_size 128 \
-  --center_crop
+  --center_crop \
+  --model_entry MultiTaskResNet \
+  --entry_args '{"embed_dim":512,"num_categories":1,"pretrained":false,"l2_norm":true}'
 
 echo "[DONE] 训练与评测完成。权重在："
 echo " - Stage-1: $ODIR/s1_e40_triplet_gpu/best.pth"
