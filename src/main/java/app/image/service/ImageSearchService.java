@@ -1,201 +1,314 @@
 package app.image.service;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.milvus.client.MilvusClient;
-import io.milvus.grpc.SearchResultData;
 import io.milvus.grpc.SearchResults;
-import io.milvus.param.MetricType;
 import io.milvus.param.R;
 import io.milvus.param.dml.SearchParam;
+import io.milvus.param.MetricType;
 import io.milvus.response.SearchResultsWrapper;
+import lombok.AllArgsConstructor;
+import org.springframework.http.*;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.stereotype.Service;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import shaded.parquet.it.unimi.dsi.fastutil.longs.LongArrayList;
 
-import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Service responsible for searching similar products using vectors.
- *
- * <p>
- * This implementation delegates the vector extraction to a Python
- * microservice via {@link PythonVectorClient}.  It then queries Milvus
- * for the nearest neighbours and aggregates the results at the
- * product level.  The default search parameters can be tuned via
- * {@code TOP_K_VECTOR} and {@code TOP_N_PRODUCT}.
- * </p>
+ * 新版向量检索服务：
+ * 1. 支持分别用【裁剪向量】和【原图向量】检索并加权合并结果；
+ * 2. 不对图片向量做融合，每张图一个向量；
+ * 3. 返回格式可直接供 Redis 消费端 (RedisTaskConsumer) 使用。
  */
+@Slf4j
 @Service
 public class ImageSearchService {
 
-    @Autowired
-    private PythonVectorClient pVectorClient;
+    // ======== 与 Milvus 表结构相关配置 ========
+    @Value("${milvus.collection.name:product_vectors}")
+    private String collection;
+
+    @Value("${vector.dimension:2048}")
+    private int vectorDim;
+
+    /** 搜索结果集大小（每条向量检索返回的 topK） */
+    @Value("${search.topk:50}")
+    private int defaultTopK;
+
+    /** 检索度量，可选：COSINE / IP / L2 */
+    @Value("${search.metric:IP}")
+    private String metric;
+
+    /** 合并时裁剪向量权重 */
+    @Value("${search.weight.crop:1.0}")
+    private float weightCrop;
+
+    /** 合并时原图向量权重 */
+    @Value("${search.weight.full:0.85}")
+    private float weightFull;
+
+    /** 检索得分过滤阈值 */
+    @Value("${search.score.threshold:0.0}")
+    private float scoreThreshold;
+
+    @Value("${vector.python.base-url}")
+    private String PY_BASE;
+
+    @Value("${vector.python.api-key}")
+    private String PY_KEY;
 
     @Autowired
-    private MilvusClient milvusClient;
+    private RestTemplate restTemplate;
 
-    private static final String COLLECTION_NAME = "product_vectors";
-    private static final String VECTOR_FIELD = "embedding";
-    /**
-     * Number of nearest neighbours to request from Milvus.  Increasing this
-     * value can improve recall at the cost of search latency.  In practice
-     * values between 100 and 200 tend to give good trade‑offs for large
-     * product catalogues.  Adjust according to your hardware and latency
-     * requirements.
-     */
-    private static final int TOP_K_VECTOR = 150;
-    /**
-     * Number of products returned to the caller.  After aggregating
-     * vectors by product ID, only the top N products with the highest
-     * average similarity scores will be kept.  This should correspond
-     * to how many results you wish to display to end users.
-     */
-    private static final int TOP_N_PRODUCT = 10;
+    private final MilvusClient milvus;
+
+    public ImageSearchService(MilvusClient milvusClient) {
+        this.milvus = milvusClient;
+    }
 
     /**
-     * Logger used for recording informational and diagnostic messages.
+     * 入口A：接收裁剪向量和原图向量，返回检索结果。
+     * 向量长度应为 vectorDim（512）。
+     *
+     * @param cropVec 裁剪后图片的向量 (可以为 null)
+     * @param fullVec 原图的向量 (可以为 null)
+     * @param topK 搜索返回条数
+     * @return SearchResponse
      */
-    private static final Logger logger = LoggerFactory.getLogger(ImageSearchService.class);
+    public SearchResponse searchByVectors(List<Float> cropVec, List<Float> fullVec, Integer topK) {
+        int tk = (topK == null || topK <= 0) ? defaultTopK : topK;
+        Map<Long, MergedHit> merged = new HashMap<>();
 
-    /**
-     * Build the Milvus search parameter object.
-     */
-    private SearchParam buildSearchParam(String collectionName, String vectorField, List<?> queryVector, int topK) {
-        List<Float> fixedVector = queryVector.stream()
-                .map(v -> {
-                    if (v instanceof Number) {
-                        return ((Number) v).floatValue();
-                    } else {
-                        throw new IllegalArgumentException("向量必须是数字类型，实际类型: " + v.getClass().getName());
-                    }
-                })
+        MetricType mt = parseMetric(metric);
+
+        if (validVec(cropVec)) {
+            List<Float> q = MetricType.IP.equals(mt) ? l2Normalize(cropVec) : cropVec;
+            accumulate(merged, searchOnce(q, tk), weightCrop);
+        }
+        if (validVec(fullVec)) {
+            List<Float> q = MetricType.IP.equals(mt) ? l2Normalize(fullVec) : fullVec;
+            accumulate(merged, searchOnce(q, tk), weightFull);
+        }
+
+
+        // 过滤并按分数排序
+        List<MergedHit> sorted = merged.values().stream()
+                .filter(h -> h.score >= scoreThreshold)
+                .sorted(Comparator.comparingDouble((MergedHit h) -> -h.score))
+                .limit(tk)
                 .collect(Collectors.toList());
 
-        return SearchParam.newBuilder()
-                .withCollectionName(collectionName)
-                .withVectorFieldName(vectorField)
-                .withOutFields(Collections.singletonList("product_id"))
-                .withTopK(topK)
-                // Use inner product to approximate cosine similarity; must match collection metric
-                .withMetricType(MetricType.IP)
-                .withVectors(Collections.singletonList(fixedVector))
-                .withParams("{\"nprobe\":10}")
-                .build();
+        return new SearchResponse(sorted);
+    }
+    private List<Float> l2Normalize(List<Float> v) {
+        double sum = 0.0;
+        for (Float x : v) sum += x * x;
+        double norm = Math.sqrt(sum);
+        if (norm <= 0) return v;
+        List<Float> out = new ArrayList<>(v.size());
+        for (Float x : v) out.add((float)(x / norm));
+        return out;
     }
 
     /**
-     * Aggregate raw search results by product ID and return the top N products
-     * based on average score.
+     * 入口B：接收图片文件，内部处理裁剪与原图向量（此处仅示例，可按实际替换）。
+     * 实际项目中建议在Controller或其它服务层先调用Python向量服务得到向量。
+     *
+     * @param image 上传图片
+     * @param topK  返回条数
+     * @return SearchResponse
+     * @throws Exception 读取图片失败
      */
-    private List<Map<String, Object>> rankByProductId(SearchResultsWrapper wrapper, SearchResultData resultData, int topN) {
-        List<?> productIds = wrapper.getFieldData("product_id", 0);
-        List<?> scoreList = resultData.getScoresList();
+    public SearchResponse searchByImage(MultipartFile image, Integer topK) throws Exception {
+        byte[] bytes = image.getBytes();
+        // stub：请替换为真实的向量获取逻辑
+        EmbedQueryResp resp = fetchVectorsFromPython(bytes);
+        List<Float> cropVec = resp.vectorCrop;
+        List<Float> fullVec = resp.vectorFull;
+        return searchByVectors(cropVec, fullVec, topK);
+    }
 
-        if (productIds == null || scoreList == null || productIds.size() != scoreList.size()) {
-            throw new IllegalStateException("Milvus 返回数据维度不一致");
+    // ======== 替换 stub：真正调用 Python /embed-query ========
+    private EmbedQueryResp fetchVectorsFromPython(byte[] bytes) {
+        String url = PY_BASE + "/embed-query";
+
+        // 用 ByteArrayResource 作为文件 part
+        ByteArrayResource filePart = new ByteArrayResource(bytes) {
+            @Override public String getFilename() { return "query.jpg"; }
+        };
+
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("image", filePart);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        headers.set("X-API-Key", PY_KEY);
+
+        HttpEntity<MultiValueMap<String, Object>> req = new HttpEntity<>(body, headers);
+
+
+        ResponseEntity<EmbedQueryResp> resp = restTemplate.exchange(
+                url, HttpMethod.POST, req, EmbedQueryResp.class);
+
+        if (!resp.getStatusCode().is2xxSuccessful() || resp.getBody() == null) {
+            throw new RuntimeException("embed-query 调用失败：" + resp.getStatusCode());
         }
-        Map<String, List<Float>> grouped = new HashMap<>();
-        for (int i = 0; i < productIds.size(); i++) {
-            String pid = Objects.toString(productIds.get(i));
-            grouped.computeIfAbsent(pid, k -> new ArrayList<>()).add(((Number) scoreList.get(i)).floatValue());
+        if (!"ok".equalsIgnoreCase(resp.getBody().status)) {
+            throw new RuntimeException("embed-query 返回错误：" + resp.getBody().status);
         }
-        return grouped.entrySet().stream()
-                .map(e -> {
-                    Map<String, Object> map = new HashMap<>();
-                    map.put("product_id", e.getKey());
-                    map.put("score", average(e.getValue()));
-                    return map;
-                })
-                .sorted((a, b) -> Float.compare((float) b.get("score"), (float) a.get("score")))
-                .limit(topN)
-                .collect(Collectors.toList());
+        // sanity check：校验维度
+        if (resp.getBody().vectorFull != null && resp.getBody().vectorFull.size() != vectorDim) {
+            throw new RuntimeException("full 向量维度不匹配");
+        }
+        if (resp.getBody().vectorCrop != null && resp.getBody().vectorCrop.size() != vectorDim) {
+            // 允许裁剪失败 -> null；但如果非空又不匹配维度，视为异常
+            throw new RuntimeException("crop 向量维度不匹配");
+        }
+        return resp.getBody();
     }
 
-    private float average(List<Float> values) {
-        return (float) values.stream().mapToDouble(Float::doubleValue).average().orElse(0.0);
+    // ======== Python 响应 DTO ========
+    @Data
+    public static class EmbedQueryResp {
+        public String status;
+
+        @JsonProperty("vector_full")
+        public List<Float> vectorFull;
+
+        @JsonProperty("vector_crop")
+        public List<Float> vectorCrop;
     }
 
-    
-    /**
-     * Perform a product search using the supplied image.  This is a convenience
-     * overload that does not specify a category and therefore delegates to
-     * {@link #searchProducts(MultipartFile, String)} with an empty
-     * category.  Use this overload when the category of the uploaded
-     * image is unknown or not important for cropping.
-     *
-     * @param multipartFile the uploaded image from the client
-     * @return a ranked list of product IDs and their aggregated scores
-     * @throws Exception if embedding fails or Milvus returns an error
-     */
-    public List<Map<String, Object>> searchProducts(MultipartFile multipartFile) throws Exception {
-        return searchProducts(multipartFile, "");
-    }
+    // =================== Milvus 搜索核心实现 ===================
 
     /**
-     * Perform a product search using the supplied image and optional category.
+     * 只用一个向量搜索 Milvus
      *
-     * <p>
-     * The image is first written to a temporary file and then embedded via the
-     * Python vectorisation service.  The resulting vector is used to query
-     * Milvus.  The search results are aggregated by product ID and sorted
-     * by descending average similarity.  Intermediate durations are logged
-     * to aid in performance tuning.  Note that any temporary files will
-     * be deleted when the method returns.
-     * </p>
-     *
-     * @param multipartFile the uploaded image from the client
-     * @param category      an optional category hint (e.g. "Shoes", "Bags").  If
-     *                      empty no category specific cropping is applied
-     * @return a list of maps containing product IDs and scores
-     * @throws Exception if embedding fails or Milvus returns an error
+     * @param vec 向量
+     * @param topK 返回条数
+     * @return RawHit 列表
      */
-    public List<Map<String, Object>> searchProducts(MultipartFile multipartFile, String category) throws Exception {
-        // Create a unique temporary file to hold the uploaded image.  Using
-        // createTempFile ensures the file name does not collide with
-        // concurrent requests.  The suffix is derived from the original
-        // filename when possible.
-        String suffix = ".jpg";
+    private List<RawHit> searchOnce(List<Float> vec, int topK) {
         try {
-            String original = multipartFile.getOriginalFilename();
-            if (original != null && original.lastIndexOf('.') != -1) {
-                suffix = original.substring(original.lastIndexOf('.'));
+            if (!validVec(vec)) return Collections.emptyList();
+            SearchParam searchParam = SearchParam.newBuilder()
+                    .withCollectionName(collection)
+                    .withMetricType(parseMetric(metric))
+                    .withOutFields(Arrays.asList("vector_id", "product_id", "image_type"))
+                    .withTopK(topK)
+                    .withVectors(Collections.singletonList(vec))
+                    .withVectorFieldName("embedding")
+                    .build();
+            R<SearchResults> r = milvus.search(searchParam);
+            if (r.getStatus() != R.Status.Success.getCode() || r.getData() == null) {
+                log.warn("Milvus search failed: {}", r.getMessage());
+                return Collections.emptyList();
             }
-        } catch (Exception ignore) {
-            // Default suffix already set
+            SearchResultsWrapper wrapper = new SearchResultsWrapper(r.getData().getResults());
+            List<SearchResultsWrapper.IDScore> idScoreList = wrapper.getIDScore(0);
+
+            // 取回外字段
+            List<Object> productIds = wrapper.getFieldWrapper("product_id").getFieldData().stream().collect(Collectors.toUnmodifiableList());
+            List<Object> imageTypes = wrapper.getFieldWrapper("image_type").getFieldData().stream().collect(Collectors.toUnmodifiableList());
+            List<Object> vectorIds  = wrapper.getFieldWrapper("vector_id").getFieldData().stream().collect(Collectors.toUnmodifiableList());
+
+            List<RawHit> hits = new ArrayList<>();
+            for (int i = 0; i < idScoreList.size(); i++) {
+                float score = idScoreList.get(i).getScore();
+                Long pid = parseLongSafe(productIds, i);
+                String imageType = parseStringSafe(imageTypes, i);
+                String vectorId  = parseStringSafe(vectorIds, i);
+                if (pid == null) continue;
+                hits.add(new RawHit(pid, vectorId, imageType, score));
+            }
+            return hits;
+        } catch (Exception e) {
+            log.error("searchOnce error", e);
+            return Collections.emptyList();
         }
-        File imageFile = File.createTempFile("upload-", suffix);
-        multipartFile.transferTo(imageFile);
-        long startTotal = System.currentTimeMillis();
-        logger.info("Starting search for file {} with category '{}'", imageFile.getName(), category);
+    }
+
+    // =================== 合并 & 工具 ===================
+
+    private void accumulate(Map<Long, MergedHit> sink, List<RawHit> hits, float weight) {
+        for (RawHit h : hits) {
+            MergedHit m = sink.computeIfAbsent(h.productId,
+                    k -> new MergedHit(h.productId, h.vectorId, h.imageType, 0f));
+            // 如果已有相同 productId，则累积权重后的分数，取最大值
+            m.score = Math.max(m.score, h.score * weight);
+        }
+    }
+
+    private boolean validVec(List<Float> v) {
+        return v != null && v.size() == vectorDim && v.stream().allMatch(Objects::nonNull);
+    }
+
+    private MetricType parseMetric(String m) {
+        if (m == null) return MetricType.IP;
+        return switch (m.toUpperCase(Locale.ROOT)) {
+            case "IP" -> MetricType.IP;
+            case "L2" -> MetricType.L2;
+            default -> MetricType.COSINE;
+        };
+    }
+
+    private Long parseLongSafe(List<Object> arr, int idx) {
         try {
-            // Step 1: extract the embedding via the Python service
-            long startExtract = System.currentTimeMillis();
-            List<Float> queryVector = pVectorClient.extractVector(imageFile, category);
-            long durationExtract = System.currentTimeMillis() - startExtract;
-            logger.debug("Vector extraction took {} ms", durationExtract);
-            // Step 2: build the search parameters and query Milvus
-            SearchParam param = buildSearchParam(COLLECTION_NAME, VECTOR_FIELD, queryVector, TOP_K_VECTOR);
-            long startSearch = System.currentTimeMillis();
-            R<SearchResults> result = milvusClient.search(param);
-            long durationSearch = System.currentTimeMillis() - startSearch;
-            logger.debug("Milvus search took {} ms", durationSearch);
-            if (result.getStatus() != R.Status.Success.getCode()) {
-                throw new RuntimeException("Milvus 查询失败: " + result.getException().getMessage());
-            }
-            SearchResultData resultData = result.getData().getResults();
-            SearchResultsWrapper wrapper = new SearchResultsWrapper(resultData);
-            List<Map<String, Object>> ranked = rankByProductId(wrapper, resultData, TOP_N_PRODUCT);
-            long totalDuration = System.currentTimeMillis() - startTotal;
-            logger.info("Search completed in {} ms; returning {} products", totalDuration, ranked.size());
-            return ranked;
-        } finally {
-            // Ensure the temporary file is removed from the filesystem
-            if (!imageFile.delete()) {
-                imageFile.deleteOnExit();
-            }
+            return (arr == null) ? null : Long.parseLong(String.valueOf((arr.get(idx))));
+        } catch (Exception e) {
+            return null;
         }
+    }
+
+    private String parseStringSafe(List<Object> arr, int idx) {
+        try { return (arr == null) ? null : String.valueOf(( arr.get(idx))); }
+        catch (Exception e) { return null; }
+    }
+
+    // =================== 向量获取 stub（务必替换） ===================
+
+    /**
+     * 示例向量生成函数，请替换为实际的向量获取逻辑。
+     */
+    private List<Float> stubVectorize(byte[] data, boolean crop) {
+        List<Float> v = new ArrayList<>(vectorDim);
+        // 示例返回 512 维零向量，实际应调用Python服务获取裁剪和非裁剪向量
+        for (int i = 0; i < vectorDim; i++) v.add(0f);
+        return v;
+    }
+
+    // =================== DTO 定义 ===================
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class SearchResponse {
+        private List<MergedHit> results;
+    }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class MergedHit {
+        private Long productId;
+        private String vectorId;   // 用于排查/回显，无需参与排序
+        private String imageType;  // main/additional_x/detail_x
+        private float score;       // 合并后的得分（已权重）
+    }
+
+    @Data @NoArgsConstructor @AllArgsConstructor
+    public static class RawHit {
+        private Long   productId;
+        private String vectorId;
+        private String imageType;
+        private float  score;
     }
 }

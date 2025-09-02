@@ -40,3 +40,7 @@ logging:
   level:
     root: INFO
     app.image: DEBUG
+vector:
+  python:
+    base-url: http://127.0.0.1:5000   # 你的Python容器地址
+    api-key: 93c1240be757f04a38c2aeb7e5cd7178

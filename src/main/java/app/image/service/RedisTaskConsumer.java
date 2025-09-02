@@ -27,7 +27,7 @@ public class RedisTaskConsumer {
     @Value("${milvus.collection.name:product_vectors}")
     private String COLLECTION;
 
-    @Value("${vector.dimension:512}")
+    @Value("${vector.dimension:2048}")
     private int VECTOR_DIM;
 
     private static final String FIELD_VECTOR_ID = "vector_id";

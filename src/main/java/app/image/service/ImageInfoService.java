@@ -15,6 +15,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * 按月查询
@@ -33,16 +34,26 @@ public class ImageInfoService {
 
     // 获取某月所有商品的所有图片，返回 ProductImages 列表
     public List<ProductImages> getAllProductImagesByMonth(int year, int month) {
+
         // 1. 一次查出本月所有主图商品
         QueryWrapper<Product> qw = new QueryWrapper<Product>()
                 .apply("YEAR(date_added) = {0} AND MONTH(date_added) = {1}", year, month);
         List<Product> products = productMapper.selectList(qw);
         products.forEach(p -> {p.setImage(HtmlUtils.cutToSix(p.getImage()));});
 
-        List<Long> productIds = products.stream().map(Product::getProductId).toList();
 
         // 2. 批量查询所有商品的类目ID（避免在循环中查询）
-        List<Map<String, Object>> productCategories = categoryMapper.getCategoriesByProductIds(productIds);
+//        List<Map<String, Object>> productCategories = categoryMapper.getCategoriesByProductIds(productIds);
+        List<Map<String, Object>> productCategories = categoryMapper.getCategoriesByProductIds(null);
+
+        Set<Long> categoryIds = productCategories.stream()
+                .map(map -> ((Number) map.get("product_id")).longValue())  // 统一转换为Long
+                .collect(Collectors.toSet());
+
+        products= products.stream()
+                .filter(product -> categoryIds.contains(product.getProductId()))
+                .collect(Collectors.toList());
+        List<Long> productIds = products.stream().map(Product::getProductId).toList();
 
         // 创建商品ID到类目名称的映射
         Map<Long, List<String>> productCategoryMap = new HashMap<>();

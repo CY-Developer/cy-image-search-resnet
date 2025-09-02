@@ -32,6 +32,11 @@ from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
 from torchvision.models.detection import FasterRCNN_ResNet50_FPN_V2_Weights
 
+# Import the global configuration so that person masking can be toggled at
+# runtime.  This avoids unnecessarily loading the heavyweight detector
+# when person suppression is disabled via ``Config.PERSON_MASK_ENABLED``.
+from  config import Config
+
 
 class Preprocessor:
     """Wraps a person detector and category based cropping logic.
@@ -51,6 +56,15 @@ class Preprocessor:
     def __init__(self, device: str = "cpu", person_score_thresh: float = 0.7) -> None:
         self.device = device
         self.person_score_thresh = person_score_thresh
+        # Decide up front whether person masking is enabled.  If it is
+        # disabled, avoid loading the expensive detector to save memory and
+        # startup time.  The detector will remain ``None`` and calls to
+        # ``remove_person`` will simply return the original image.
+        if not Config.PERSON_MASK_ENABLED:
+            self.detector = None
+            self.preprocess_transform = None
+            self.categories = []
+            return
         # Attempt to load the detection model.  If it fails we set
         # ``self.detector`` to ``None`` so that calls to ``remove_person``
         # simply return the original image.
@@ -85,7 +99,9 @@ class Preprocessor:
         Image.Image
             A new PIL image with detected people painted white.
         """
-        if self.detector is None or self.preprocess_transform is None:
+        # If person masking is disabled or the detector failed to load,
+        # simply return the original image.  See ``Config.PERSON_MASK_ENABLED``.
+        if (not Config.PERSON_MASK_ENABLED) or self.detector is None or self.preprocess_transform is None:
             return image
         # Convert image to tensor using the builtin transform from the weights
         img_tensor = self.preprocess_transform(image)

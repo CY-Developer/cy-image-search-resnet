@@ -86,6 +86,11 @@ class Config:
         encoded dictionary containing the product ID (if available), the
         offending file path and a textual error message.
     """
+    # ---- defaults for vectorisation pipeline (MUST exist) ----
+    def __init__(self):
+        pass
+
+    IMG_SIZE = 224
 
     # Path to the model checkpoint.  Replace with your trained weight file.
     MODEL_PATH: str = "model_final.pth"
@@ -110,7 +115,99 @@ class Config:
     # Embedding configuration.  Must match the value used during training.
     EMBEDDING_DIM: int = 256
 
+    # ------------------------------------------------------------------
+    # New configuration for enhanced vectorisation
+    # ------------------------------------------------------------------
+    # Path to the 2048‑feature backbone checkpoint (.pth).  This file
+    # should correspond to the model trained in your offline pipeline
+    # (e.g. model_final.pth).  You can override this via the
+    # ``CKPT_PATH`` environment variable.
+    CKPT_PATH: str = "model_final.pth"
+
+    # Path to the linear adapter (.npz) used to align raw 2048‑dimensional
+    # features with the search space.  The adapter file must contain
+    # ``W`` (or equivalent), ``mean_q`` and ``mean_g`` arrays.  See
+    # ``features._load_adapter`` for details.  Override via
+    # ``ADAPTER_PATH`` environment variable.
+    ADAPTER_PATH: str = "adapter_linear.npz"
+
+    # Directory containing your Milvus index snapshot.  This is used to
+    # locate reference prototype vectors (gf.npy or other files) if
+    # required.  Override via the ``INDEX_DIR`` environment variable.
+    INDEX_DIR: str = "index_s0_snapshot"
+
+    # Similarity threshold used when deciding whether to accept a
+    # cropped detail vector as matching the product.  When the cosine
+    # similarity between the crop vector and any of the main/appendix
+    # vectors exceeds this value the crop is stored with full weight.
+    # Lower values are more permissive and may admit noisy crops.
+    TH_MATCH: float = 0.38
+
+    # Weight assigned to detail vectors when they fail the match
+    # threshold.  These vectors are still stored to improve recall but
+    # contribute less to the overall ranking when scoring user queries.
+    WEIGHT_LOW_DETAIL: float = 0.60
+
+    # Weight used to fuse the full and crop query vectors during
+    # retrieval.  The Java ``ImageSearchService`` can use this to
+    # combine both similarities with ``score = max(sim_crop, ALPHA_FUSE
+    # * sim_full)``.  Values less than 1 favour the crop vector.
+    ALPHA_FUSE: float = 0.85
+
+    # Redis configuration for storing embeddings.  You can override
+    # these via environment variables (e.g. REDIS_URL).
+    REDIS_URL = "redis://host.docker.internal:6379/0"
+    REDIS_KEY_PREFIX: str = "vecsvc:"
+
     # Key for storing error information in Redis.  The service will append
     # failure records to this list.  A consuming process can monitor this
     # list for troubleshooting.
     ERROR_LIST_KEY: str = "error_ids"
+
+    # ------------------------------------------------------------------
+    # New configuration toggles for advanced preprocessing
+    # ------------------------------------------------------------------
+    # Enable category‑focused cropping.  When set to True the service will
+    # attempt to locate the region of interest for certain categories using
+    # Grad‑CAM and remove the rest of the image by painting it white.  This
+    # helps the model focus on the relevant object (e.g. a watch) even in
+    # cluttered scenes.  See ``service.py`` for implementation details.
+    CATEGORY_FOCUSED_CROP: bool = True
+
+    # Specify which high‑level categories should use the focused crop.  The
+    # keys should be lower‑case substrings that might appear in the category
+    # string supplied by clients.  If the value is True and the substring
+    # appears in the category then the cropping heuristic is applied.  If no
+    # entry matches or the value is False the image will be processed as
+    # normal.  You can enable additional classes once your model is trained
+    # to recognise them.
+    FOCUS_ENABLED_CLASSES: dict = {
+        "watch": True,
+        "bag": False,
+        "shoe": False,
+        "jewelry": False,
+    }
+
+    # Image size used when computing the Grad‑CAM heatmap.  This can be
+    # larger than ``IMAGE_SIZE`` to preserve more spatial detail.  The
+    # default of 448 offers a good compromise between speed and fidelity.
+    FOCUS_IMG_SIZE: int = 448
+
+    # Proportion of the heatmap to retain when determining the bounding box.
+    # For example, a value of 0.15 keeps the top 15% of activation pixels and
+    # discards the rest.  Smaller values yield tighter crops at the risk of
+    # missing part of the object, whereas larger values yield looser crops.
+    FOCUS_TOP_PERCENT: float = 0.15
+
+    # Amount of padding to add (as a fraction of the bounding box size) when
+    # expanding the crop box.  This can help ensure the entire object is
+    # captured even if the heatmap is conservative.
+    FOCUS_PAD_RATIO: float = 0.05
+
+    # Enable person masking.  When ``True`` the service uses a pre‑trained
+    # detector to find people in the image and paints them white before
+    # feeding the image into the model.  Set to ``False`` to disable this
+    # behaviour entirely.  Disabling person masking is useful when the
+    # detector might erroneously mask the target object (e.g. watches on
+    # wrists).  The default is ``False`` to favour object preservation.
+    PERSON_MASK_ENABLED: bool = False

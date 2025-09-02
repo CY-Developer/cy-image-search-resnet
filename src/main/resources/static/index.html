@@ -36,7 +36,6 @@
 
 <script>
     const $ = (s)=>document.querySelector(s);
-    let uploaded = null; // {fileId, filename}
 
     // 预览
     $('#file').addEventListener('change', (e)=>{
@@ -46,41 +45,28 @@
         $('#preview').innerHTML = `<img src="${url}">`;
     });
 
-    // 上传
-    $('#btnUpload').addEventListener('click', async ()=>{
+    // “提交查询”按钮：直接把文件 POST 到 /api/search（multipart/form-data）
+    $('#btnSearch').addEventListener('click', async ()=>{
         const f = $('#file').files?.[0];
         if(!f){ $('#msg').textContent = '请先选择图片'; return; }
-        const fd = new FormData();
-        fd.append('file', f);
-        $('#msg').textContent = '上传中...';
-        try{
-            const resp = await fetch('/api/upload', { method:'POST', body: fd });
-            if(!resp.ok) throw new Error('上传失败');
-            uploaded = await resp.json();
-            $('#msg').textContent = `上传成功：${uploaded.filename}`;
-        }catch(err){
-            console.error(err);
-            $('#msg').textContent = '上传失败';
-        }
-    });
 
-    // 提交查询
-    $('#btnSearch').addEventListener('click', async ()=>{
+        const fd = new FormData();
+        fd.append('image', f);                  // 和后端 @RequestPart("image") 对应
+        // 可选：fd.append('topk', '20');
+
         $('#msg').textContent = '查询中...';
         try{
-            const payload = uploaded ? { fileId: uploaded.fileId } : {};
             const resp = await fetch('/api/search', {
-                method:'POST',
-                headers: { 'Content-Type':'application/json' },
-                body: JSON.stringify(payload)
+                method: 'POST',
+                body: fd,            // 千万不要手动设置 Content-Type，浏览器会自动带上 boundary
             });
-            if(!resp.ok) throw new Error('查询失败');
-            const data = await resp.json(); // [{productId,title,catalogPath,imageUrl}, ...]
+            if(!resp.ok) throw new Error(await resp.text());
+            const data = await resp.json(); // 期望后端返回 List<ProductItem>
             render(data);
             $('#msg').textContent = `共 ${data.length} 个结果`;
         }catch(err){
             console.error(err);
-            $('#msg').textContent = '查询失败';
+            $('#msg').textContent = '查询失败：' + err.message;
         }
     });
 
@@ -94,5 +80,6 @@
         $('#result').innerHTML = html;
     }
 </script>
+
 </body>
 </html>

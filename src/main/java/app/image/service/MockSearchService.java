@@ -2,33 +2,36 @@ package app.image.service;
 
 import app.image.entity.Product;
 import app.image.entity.ProductItem;
-import app.image.mapper.CategoryMapper;
 import app.image.mapper.ProductMapper;
-import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 @Service
 public class MockSearchService {
     @Autowired
     private ProductMapper productMapper; // 新增：注入 CategoryMapper
+    @Autowired
+    private ImageSearchService imageSearchService; // 新增：注入 CategoryMapper
 
 
-    public List<ProductItem> top20() {
+    public List<ProductItem> top20(MultipartFile image, int topk) throws Exception {
         List<ProductItem> items = new ArrayList<>();
-        int[] array = {33995,33996,33997,33998,33999,34000,34001,34002,34003,34004,
-                34005,34006,34007,34008,34009,34010,34011,34012,34013,34014,34015};
-        List<Long> idList = java.util.stream.IntStream.of(array)
-                .mapToLong(i -> i)
-                .boxed()
-                .toList();
-        List<Product> products = productMapper.selectBatchIds(idList);
+        ImageSearchService.SearchResponse searchResponse = imageSearchService.searchByImage(image, topk);
+        List<ImageSearchService.MergedHit> results = searchResponse.getResults();
+        List<Long> list = results.stream().map(ImageSearchService.MergedHit::getProductId).toList();
+//        int[] array = {33995,33996,33997,33998,33999,34000,34001,34002,34003,34004,
+//                34005,34006,34007,34008,34009,34010,34011,34012,34013,34014,34015};
+//        List<Long> idList = java.util.stream.IntStream.of(array)
+//                .mapToLong(i -> i)
+//                .boxed()
+//                .toList();
+        List<Product> products = productMapper.selectBatchIds(list);
         products.forEach(product -> {
             // ===== 在这里替换为你真实的 20 个商品（示例演示）=====
             seed(items, String.valueOf(product.getProductId()), "",

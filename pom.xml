@@ -20,7 +20,7 @@
 
     <properties>
         <java.version>17</java.version>
-        <milvus.version>2.2.11</milvus.version>
+        <milvus.version>2.4.11</milvus.version>
     </properties>
 
     <repositories>

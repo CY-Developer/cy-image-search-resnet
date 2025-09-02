@@ -34,6 +34,9 @@ from  config import Config
 from  model import load_model
 from  preprocess import Preprocessor
 
+from typing import Dict
+
+
 
 class ImageEmbeddingService:
     """Encapsulates all logic for computing image embeddings.
@@ -88,6 +91,136 @@ class ImageEmbeddingService:
                 self.global_mask = None
 
     # ------------------------------------------------------------------
+    # Internal helpers for category‑focused cropping
+    # ------------------------------------------------------------------
+    def _apply_focus_crop(self, image: Image.Image, category: str) -> Image.Image:
+        """Apply a Grad‑CAM based crop to isolate the relevant object.
+
+        When ``config.CATEGORY_FOCUSED_CROP`` is enabled and the supplied
+        ``category`` matches an entry in ``config.FOCUS_ENABLED_CLASSES``
+        the model is used to generate a heatmap highlighting the most
+        discriminative region of the image.  Pixels outside of the
+        resulting bounding box are painted white to reduce noise.  If
+        anything goes wrong or the category does not match then the
+        original image is returned unchanged.
+
+        Parameters
+        ----------
+        image: Image.Image
+            The original PIL image.
+
+        category: str
+            Category string provided by the caller (e.g. "watch").
+
+        Returns
+        -------
+        Image.Image
+            Image with only the relevant region retained and the rest
+            whitened.  When disabled or unmatched, the input image is
+            returned.
+        """
+        # Bail early if the feature is disabled
+        if not self.config.CATEGORY_FOCUSED_CROP:
+            return image
+        # Normalise category string
+        cat = category.lower() if category else ""
+        # Determine whether this category should use focus cropping
+        enabled = False
+        for key, flag in getattr(self.config, "FOCUS_ENABLED_CLASSES", {}).items():
+            if flag and key in cat:
+                enabled = True
+                break
+        if not enabled:
+            return image
+        try:
+            # Build a transform for Grad‑CAM with a larger size to retain detail
+            focus_size = getattr(self.config, "FOCUS_IMG_SIZE", 448)
+            focus_transform = transforms.Compose([
+                transforms.Resize((focus_size, focus_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+            ])
+            # Prepare the image tensor and dummy mask for the model
+            rgb = image.convert("RGB")
+            img_tensor = focus_transform(rgb).to(self.device)  # (3, H, W)
+            # Zero mask channel
+            mask_tensor = torch.zeros((1, focus_size, focus_size), dtype=torch.float32, device=self.device)
+            inp = torch.cat([img_tensor, mask_tensor], dim=0).unsqueeze(0)
+            # Hook to capture the activations of the last convolutional block
+            features: list = []
+            def forward_hook(module, input, output):
+                # Ensure gradients are available on the output for CAM
+                output.retain_grad()
+                features.append(output)
+            # Access layer4 from the ResNet backbone
+            try:
+                last_conv = self.model.feature_extractor[7]
+            except Exception:
+                last_conv = None
+            if last_conv is None:
+                return image
+            handle = last_conv.register_forward_hook(forward_hook)
+            # Forward pass
+            inp.requires_grad_(True)
+            embedding, _ = self.model(inp)
+            # Use the L2 norm of the embedding as the optimisation target
+            loss = embedding.norm(p=2)
+            self.model.zero_grad()
+            loss.backward()
+            handle.remove()
+            # If the hook did not fire, skip cropping
+            if not features:
+                return image
+            # Extract activations and their gradients
+            act = features[0][0].detach().cpu().numpy()  # (C, H, W)
+            grad = features[0].grad[0].detach().cpu().numpy()  # (C, H, W)
+            # Compute channel weights as global average of gradients
+            weights = grad.mean(axis=(1, 2))  # (C,)
+            # Compute the raw heatmap
+            cam = np.maximum((act * weights[:, None, None]).sum(axis=0), 0)
+            if cam.max() > 0:
+                cam = cam / (cam.max() + 1e-6)
+            # Resize the heatmap back to the original image resolution
+            cam_img = Image.fromarray((cam * 255).astype(np.uint8))
+            cam_resized = cam_img.resize((image.width, image.height), resample=Image.BILINEAR)
+            cam_arr = np.array(cam_resized, dtype=np.float32) / 255.0
+            # Determine a threshold keeping only the top percentage of activations
+            top_pct = getattr(self.config, "FOCUS_TOP_PERCENT", 0.15)
+            flat = cam_arr.flatten()
+            if top_pct <= 0.0 or top_pct >= 1.0:
+                thr = 0.0
+            else:
+                thr = np.quantile(flat, 1.0 - top_pct)
+            mask = cam_arr >= thr
+            # If no activations exceed the threshold, skip cropping
+            if not mask.any():
+                return image
+            # Compute the bounding box of the selected region
+            ys, xs = np.where(mask)
+            y1 = int(ys.min())
+            y2 = int(ys.max()) + 1
+            x1 = int(xs.min())
+            x2 = int(xs.max()) + 1
+            # Expand the box by a small ratio
+            pad_ratio = getattr(self.config, "FOCUS_PAD_RATIO", 0.05)
+            pad_x = int((x2 - x1) * pad_ratio)
+            pad_y = int((y2 - y1) * pad_ratio)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(image.width, x2 + pad_x)
+            y2 = min(image.height, y2 + pad_y)
+            # Build a mask to retain only the region inside the bounding box
+            img_arr = np.array(rgb).copy()
+            keep_mask = np.zeros((image.height, image.width), dtype=bool)
+            keep_mask[y1:y2, x1:x2] = True
+            img_arr[~keep_mask] = 255
+            return Image.fromarray(img_arr)
+        except Exception:
+            # Fail gracefully by returning the original image
+            return image
+
+    # ------------------------------------------------------------------
     # Helper functions
     # ------------------------------------------------------------------
     def _hash_bytes(self, data: bytes) -> str:
@@ -128,9 +261,20 @@ class ImageEmbeddingService:
             and a mask tensor of shape ``(1, H, W)``.  The mask will be
             all zeros if no global watermark mask is configured.
         """
-        # Remove persons if a detector is available
-        img = self.preprocessor.remove_person(image) if self.config.CROPPING_ENABLED else image
-        # Apply category specific cropping if enabled
+        # ------------------------------------------------------------------
+        # Apply a series of preprocessing steps in the following order:
+        #   1) Category‑focused cropping via Grad‑CAM (whitens background)
+        #   2) Person suppression (whitens people) if enabled
+        #   3) Heuristic category cropping (e.g. zoom into shoes)
+        # These operations operate on PIL images and return a new PIL image.
+
+        # Step 1: Use the model to isolate the relevant object when enabled
+        img = self._apply_focus_crop(image, category)
+        # Step 2: Mask out persons if person suppression is enabled.  The
+        # ``remove_person`` method will return the original image when
+        # ``Config.PERSON_MASK_ENABLED`` is False.
+        img = self.preprocessor.remove_person(img)
+        # Step 3: Apply category specific cropping (heuristic) if requested
         if self.config.CROPPING_ENABLED and category:
             img = self.preprocessor.crop_by_category(img, category)
         # Convert to RGB just in case and apply transforms
