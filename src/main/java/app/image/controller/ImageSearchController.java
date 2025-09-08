@@ -103,7 +103,8 @@ public class ImageSearchController {
     }
 
     private Path resolveLocal(String sixTail) throws IOException {
-        Path root = Paths.get("E:\\wrok\\app\\idea\\code\\cy-image-search-resnet\\model-service\\6_jw7Ja");
+        sixTail = sixTail.substring(sixTail.lastIndexOf("/")+1);
+        Path root = Paths.get("D:\\fileName\\downloads");
 
         // 方案1：直接拼
         Path p1 = root.resolve(sixTail.replace("/", File.separator));
